@@ -1,0 +1,138 @@
+{
+  "info": {
+    "name": "API SII",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:3000",
+      "type": "string"
+    },
+    {
+      "key": "api_key",
+      "value": "57e5abfc9a91c1e6f0aa381c801604a9dee9983d58e1ff6db8dafacf614a96b4",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/health",
+        "description": "Verifica que el servidor esté corriendo. No requiere autenticación."
+      }
+    },
+    {
+      "name": "Estado F29",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/getEstadoF29",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"rut\": \"REEMPLAZAR_RUT\",\n  \"pass\": \"REEMPLAZAR_PASS\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "description": "Obtiene el estado del Formulario 29 (IVA). Las credenciales van en el body."
+      }
+    },
+    {
+      "name": "RCV Compras — Por Mes",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/RCV/compras/04/2025",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "description": "Obtiene compras del mes. Credenciales tomadas de SII_RUT / SII_PASS en .env. Parámetros en la URL: /compras/{mes}/{año}"
+      }
+    },
+    {
+      "name": "RCV Ventas — Por Mes",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/RCV/ventas/04/2025",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "description": "Obtiene ventas del mes. Parámetros en la URL: /ventas/{mes}/{año}"
+      }
+    },
+    {
+      "name": "[Error] Sin API Key",
+      "request": {
+        "method": "GET",
+        "url": "{{base_url}}/health",
+        "description": "Prueba que el health check NO requiere API key."
+      }
+    },
+    {
+      "name": "[Error] API Key inválida",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/getEstadoF29",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Api-Key",    "value": "clave_incorrecta" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"rut\": \"12345678-9\",\n  \"pass\": \"test\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "description": "Debe retornar 401."
+      }
+    },
+    {
+      "name": "[Error] Mes inválido",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/RCV/compras/13/2025",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "description": "Mes 13 es inválido. Debe retornar 400."
+      }
+    },
+    {
+      "name": "[Error] Año inválido",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/RCV/compras/04/25",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "description": "Año '25' es inválido (debe tener 4 dígitos). Debe retornar 400."
+      }
+    }
+  ]
+}

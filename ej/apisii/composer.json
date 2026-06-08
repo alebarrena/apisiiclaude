@@ -1,0 +1,26 @@
+{
+    "name": "sasco/libredte-api-client",
+    "description": "Cliente para realizar la integración con los servicios web de API Gateway",
+    "type": "library",
+    "keywords": ["api", "sii", "dte", "facturación electrónica"],
+    "homepage": "https://apigateway.cl",
+    "license": "LGPL-3.0+",
+    "authors": [
+        {
+            "name": "SASCO SpA",
+            "homepage": "https://sasco.cl"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/LibreDTE/apigateway-client-php/issues",
+        "source": "https://github.com/LibreDTE/apigateway-client-php"
+    },
+    "require": {
+        "php": "7.3.* || 7.4.*",
+        "guzzlehttp/guzzle": "^7",
+        "sasco/libredte-api-client": "1.*"
+    },
+    "autoload": {
+        "psr-4": {"sasco\\LibreDTE\\API\\": "src/"}
+    }
+}

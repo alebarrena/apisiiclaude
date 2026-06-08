@@ -1,0 +1,15 @@
+# Node.js
+node/node_modules/
+node/dist/
+node/.env
+node/debug.log
+node/debug_*.png
+node/debug_*.html
+node/download/
+
+# PHP / Composer
+vendor/
+lumen/apisii/cookies.txt
+
+# Logs
+*.log
