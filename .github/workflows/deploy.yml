@@ -16,17 +16,17 @@ jobs:
         run: docker build -t sii-api:latest ./node
 
       - name: Export and compress image
-        run: docker save sii-api:latest | gzip > /tmp/sii-api.tar.gz
+        run: docker save sii-api:latest | gzip -1 > /tmp/sii-api.tar.gz && ls -lh /tmp/sii-api.tar.gz
 
-      - name: Transfer image to VPS via SCP
+      - name: Transfer image to VPS via rsync
         run: |
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
           chmod 600 /tmp/deploy_key
-          scp -P ${{ secrets.VPS_PORT }} \
-              -i /tmp/deploy_key \
-              -o StrictHostKeyChecking=no \
-              /tmp/sii-api.tar.gz \
-              ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/tmp/sii-api.tar.gz
+          rsync -az --partial --progress \
+            -e "ssh -p ${{ secrets.VPS_PORT }} -i /tmp/deploy_key -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=40" \
+            /tmp/sii-api.tar.gz \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/tmp/sii-api.tar.gz
+          rm -f /tmp/deploy_key
 
       - name: Deploy on VPS
         uses: appleboy/ssh-action@v1.2.0
