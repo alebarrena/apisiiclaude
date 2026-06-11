@@ -4,36 +4,11 @@ on:
   push:
     branches: [main]
 
-env:
-  IMAGE: ghcr.io/alebarrena/apisiiclaude
-
 jobs:
-  build-push-deploy:
+  deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./node
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
-
       - name: Deploy on VPS
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -42,21 +17,9 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.VPS_PORT }}
           script: |
-            mkdir -p /var/www/sii/node
-            cat > /var/www/sii/node/docker-compose.yml << 'EOF'
-            services:
-              api:
-                image: ghcr.io/alebarrena/apisiiclaude:latest
-                container_name: sii-api
-                restart: unless-stopped
-                ports:
-                  - "127.0.0.1:3000:3000"
-                env_file:
-                  - .env
-                volumes:
-                  - ./download:/app/download
-            EOF
-            cd /var/www/sii/node
-            docker compose pull
+            cd /var/www/sii/apisiiclaude
+            git pull origin main
+            cd node
+            docker build -t sii-api:latest .
             docker compose up -d --remove-orphans
             docker image prune -f

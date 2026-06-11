@@ -1,6 +1,6 @@
 services:
   api:
-    image: ghcr.io/alebarrena/apisiiclaude:latest
+    image: sii-api:latest
     container_name: sii-api
     restart: unless-stopped
     ports:
