@@ -5,10 +5,29 @@ on:
     branches: [main]
 
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t sii-api:latest ./node
+
+      - name: Export and compress image
+        run: docker save sii-api:latest | gzip > /tmp/sii-api.tar.gz
+
+      - name: Transfer image to VPS via SCP
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          scp -P ${{ secrets.VPS_PORT }} \
+              -i /tmp/deploy_key \
+              -o StrictHostKeyChecking=no \
+              /tmp/sii-api.tar.gz \
+              ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/tmp/sii-api.tar.gz
+
       - name: Deploy on VPS
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -16,11 +35,24 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.VPS_PORT }}
-          command_timeout: 60m
+          command_timeout: 10m
           script: |
-            cd /var/www/sii/apisiiclaude
-            git pull origin main
-            cd node
-            docker build -t sii-api:latest .
+            docker load < /tmp/sii-api.tar.gz
+            rm -f /tmp/sii-api.tar.gz
+            mkdir -p /var/www/sii/node/download
+            cat > /var/www/sii/node/docker-compose.yml << 'EOF'
+            services:
+              api:
+                image: sii-api:latest
+                container_name: sii-api
+                restart: unless-stopped
+                ports:
+                  - "127.0.0.1:3000:3000"
+                env_file:
+                  - .env
+                volumes:
+                  - ./download:/app/download
+            EOF
+            cd /var/www/sii/node
             docker compose up -d --remove-orphans
             docker image prune -f
