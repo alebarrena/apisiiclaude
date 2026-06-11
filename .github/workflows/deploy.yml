@@ -16,6 +16,7 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.VPS_PORT }}
+          command_timeout: 30m
           script: |
             cd /var/www/sii/apisiiclaude
             git pull origin main
