@@ -34,7 +34,11 @@ jobs:
           port: ${{ secrets.VPS_PORT }}
           command_timeout: 20m
           script: |
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/sii-api:latest
+            for i in 1 2 3 4 5; do
+              docker pull ${{ secrets.DOCKERHUB_USERNAME }}/sii-api:latest && break
+              echo "Pull attempt $i failed, retrying in 15s..."
+              sleep 15
+            done
             mkdir -p /var/www/sii/node/download
             cat > /var/www/sii/node/docker-compose.yml << 'EOF'
             services:
