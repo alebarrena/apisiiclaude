@@ -12,21 +12,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: docker build -t sii-api:latest ./node
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Export and compress image
-        run: docker save sii-api:latest | gzip -1 > /tmp/sii-api.tar.gz && ls -lh /tmp/sii-api.tar.gz
-
-      - name: Transfer image to VPS via rsync
-        run: |
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
-          chmod 600 /tmp/deploy_key
-          rsync -az --partial --progress \
-            -e "ssh -p ${{ secrets.VPS_PORT }} -i /tmp/deploy_key -o StrictHostKeyChecking=no -o ServerAliveInterval=15 -o ServerAliveCountMax=40" \
-            /tmp/sii-api.tar.gz \
-            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/tmp/sii-api.tar.gz
-          rm -f /tmp/deploy_key
+      - name: Build and push to Docker Hub
+        uses: docker/build-push-action@v6
+        with:
+          context: ./node
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/sii-api:latest
 
       - name: Deploy on VPS
         uses: appleboy/ssh-action@v1.2.0
@@ -35,15 +32,14 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.VPS_PORT }}
-          command_timeout: 10m
+          command_timeout: 20m
           script: |
-            docker load < /tmp/sii-api.tar.gz
-            rm -f /tmp/sii-api.tar.gz
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/sii-api:latest
             mkdir -p /var/www/sii/node/download
             cat > /var/www/sii/node/docker-compose.yml << 'EOF'
             services:
               api:
-                image: sii-api:latest
+                image: abarrenaprisma/sii-api:latest
                 container_name: sii-api
                 restart: unless-stopped
                 ports:
