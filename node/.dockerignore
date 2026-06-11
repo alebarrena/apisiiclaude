@@ -1,0 +1,8 @@
+node_modules
+dist
+.env
+*.log
+debug_*.png
+debug_*.html
+download
+test.js
