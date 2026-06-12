@@ -210,6 +210,14 @@ function parseRcvDetailsFromJson(raw: Record<string, unknown>, operacion: "COMPR
   return parseRcvDetails(data, operacion);
 }
 
+async function pollUntil(check: () => boolean, timeoutMs: number, label: string): Promise<void> {
+  const start = Date.now();
+  while (!check() && Date.now() - start < timeoutMs) {
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  if (!check()) throw new Error(`Timeout esperando ${label}`);
+}
+
 async function fetchRCV(
   month: string,
   year: string,
@@ -229,13 +237,22 @@ async function fetchRCV(
   try {
     const page = await browser.newPage();
 
-    // Acumulador de respuestas getResumen — Angular puede dispararlas en momentos no determinísticos
+    // Todos los acumuladores se llenan via page.on("response") antes de cualquier navegación
+    // para evitar race conditions donde la respuesta llega antes de registrar waitForResponse.
     const resumenResponses: Record<string, unknown>[] = [];
+    let empresasAutorizadasReceived = false;
+    let detalleRaw: Record<string, unknown> | null = null;
+    let detalleStatus = 0;
+
     page.on("response", async (r) => {
-      if (r.url().includes("sii.cl") && r.url().includes("services")) {
-        console.log(`[net] ${r.status()} ${r.request().method()} ${r.url()}`);
+      const url = r.url();
+      if (url.includes("sii.cl") && url.includes("services")) {
+        console.log(`[net] ${r.status()} ${r.request().method()} ${url}`);
       }
-      if (r.url().includes("getResumen") && r.request().method() === "POST" && r.status() === 200) {
+      if (url.includes("getDcvEmpresasAutorizadas")) {
+        empresasAutorizadasReceived = true;
+      }
+      if (url.includes("getResumen") && r.request().method() === "POST" && r.status() === 200) {
         try {
           const data = await r.json() as Record<string, unknown>;
           resumenResponses.push(data);
@@ -243,6 +260,18 @@ async function fetchRCV(
           console.log(`[net] getResumen acumulado #${resumenResponses.length}, items: ${Array.isArray(items) ? items.length : "n/a"}`);
         } catch (e) {
           console.warn("[net] getResumen no-JSON:", (e as Error).message);
+        }
+      }
+      if (url.includes("getDetalle")) {
+        detalleStatus = r.status();
+        if (r.status() === 200) {
+          try {
+            const data = await r.json() as Record<string, unknown>;
+            detalleRaw = data;
+            console.log(`[net] getDetalle recibido, keys: ${Object.keys(data)}, snippet: ${JSON.stringify(data).slice(0, 200)}`);
+          } catch (e) {
+            console.warn("[net] getDetalle no-JSON:", (e as Error).message);
+          }
         }
       }
     });
@@ -257,11 +286,8 @@ async function fetchRCV(
     });
 
     await page.waitForSelector("#periodoMes", { timeout: PAGE_TIMEOUT_MS });
-    // Esperar a que getDcvEmpresasAutorizadas cargue el RUT de empresa
-    await page.waitForResponse(
-      (r) => r.url().includes("getDcvEmpresasAutorizadas"),
-      { timeout: PAGE_TIMEOUT_MS }
-    );
+    // El listener ya captura getDcvEmpresasAutorizadas; polling evita la race condition
+    await pollUntil(() => empresasAutorizadasReceived, PAGE_TIMEOUT_MS, "getDcvEmpresasAutorizadas");
     await new Promise((r) => setTimeout(r, 500));
 
     // 3. Setear período deseado
@@ -279,17 +305,7 @@ async function fetchRCV(
     console.log("[fetchRCV] clickeando Consultar...");
     await page.click('button[type="submit"]');
 
-    // Esperar a que aparezca la primera getResumen (acumulada por el listener)
-    const waitForResumen = async (minCount: number, timeoutMs: number): Promise<boolean> => {
-      const start = Date.now();
-      while (resumenResponses.length < minCount && Date.now() - start < timeoutMs) {
-        await new Promise((r) => setTimeout(r, 200));
-      }
-      return resumenResponses.length >= minCount;
-    };
-
-    const got1 = await waitForResumen(1, PAGE_TIMEOUT_MS);
-    if (!got1) throw new Error("Primera getResumen no se recibió (tras click en Consultar)");
+    await pollUntil(() => resumenResponses.length >= 1, PAGE_TIMEOUT_MS, "primera getResumen");
     console.log(`[fetchRCV] primera getResumen recibida`);
 
     // Esperar a que el DOM renderice los resultados
@@ -299,8 +315,7 @@ async function fetchRCV(
     );
     await new Promise((r) => setTimeout(r, 500));
 
-    // 5. Para ventas: cambiar al tab VENTA; capturar la getResumen que Angular
-    //    dispara automáticamente o, si no la dispara, hacer clic en Consultar otra vez
+    // 5. Para ventas: cambiar al tab VENTA
     let summaryRaw: Record<string, unknown>;
 
     if (mode === "ventas") {
@@ -308,7 +323,6 @@ async function fetchRCV(
 
       const tabText = await page.evaluate(() => {
         const tabs = Array.from(document.querySelectorAll(".nav-tabs a, .nav-tabs li a"));
-        console.log("[page] tabs:", JSON.stringify(tabs.map((t) => t.textContent?.trim())));
         const tab = tabs.find((t) => /venta/i.test(t.textContent?.trim() ?? ""));
         if (tab) { (tab as HTMLElement).click(); return tab.textContent?.trim(); }
         return null;
@@ -317,14 +331,13 @@ async function fetchRCV(
       if (!tabText) throw new Error("Tab VENTA no encontrado en el DOM");
       console.log(`[fetchRCV] tab VENTA clickeado: "${tabText}"`);
 
-      // Esperar hasta 8 segundos a que Angular dispare getResumen automáticamente
-      let gotAuto = await waitForResumen(baselineCount + 1, 8_000);
+      const gotAuto = await pollUntil(() => resumenResponses.length > baselineCount, 8_000, "")
+        .then(() => true).catch(() => false);
 
       if (!gotAuto) {
         console.log("[fetchRCV] tab VENTA no disparó getResumen automático, haciendo segundo Consultar");
         await page.click('button[type="submit"]');
-        gotAuto = await waitForResumen(baselineCount + 1, PAGE_TIMEOUT_MS);
-        if (!gotAuto) throw new Error("Segunda getResumen no se recibió tras click en Consultar (tab VENTA)");
+        await pollUntil(() => resumenResponses.length > baselineCount, PAGE_TIMEOUT_MS, "segunda getResumen (VENTA)");
       } else {
         console.log("[fetchRCV] tab VENTA disparó getResumen automáticamente");
       }
@@ -339,12 +352,10 @@ async function fetchRCV(
 
     const summaries = parseRcvSummaryFromJson(summaryRaw, operacion);
 
-    // 6. Si se piden detalles, hacer clic en "Descargar Detalles" (con reintentos si SII devuelve 500)
+    // 6. Si se piden detalles, hacer clic en "Descargar Detalles"
     const clickDescargarDetalles = () => page.evaluate(() => {
       const isDetalles = (b: Element) => /descargar\s*det/i.test(b.textContent?.trim() ?? "");
       const allBtns = Array.from(document.querySelectorAll("button"));
-      const allBtnTexts = allBtns.map((b) => b.textContent?.trim() ?? "").filter(Boolean);
-      console.log("[page] botones disponibles:", JSON.stringify(allBtnTexts));
       const activePane = document.querySelector(".tab-pane.active");
       if (activePane) {
         const btn = Array.from(activePane.querySelectorAll("button")).find(isDetalles);
@@ -359,31 +370,20 @@ async function fetchRCV(
 
     let detalles: object[] = [];
     if (detallado) {
-      let detalleRaw: Record<string, unknown> | null = null;
-
       for (let intento = 1; intento <= 3; intento++) {
-        const responsePromise = page.waitForResponse(
-          (r) => r.url().includes("getDetalle") || r.url().includes("Detalle"),
-          { timeout: PAGE_TIMEOUT_MS }
-        );
+        detalleRaw = null;
+        detalleStatus = 0;
+
         const clickResult = await clickDescargarDetalles();
         console.log(`[fetchRCV] intento ${intento}: clickDescargarDetalles → ${clickResult}`);
+        if (!clickResult) throw new Error("No se encontró el botón 'Descargar Detalles' en el portal SII.");
 
-        if (!clickResult) {
-          throw new Error("No se encontró el botón 'Descargar Detalles' en el portal SII.");
-        }
+        await pollUntil(() => detalleStatus !== 0, PAGE_TIMEOUT_MS, `getDetalle intento ${intento}`);
+        console.log(`[fetchRCV] intento ${intento}: detalleStatus=${detalleStatus}`);
 
-        const detalleResp = await responsePromise;
-        console.log(`[fetchRCV] intento ${intento}: response → ${detalleResp.status()} ${detalleResp.url()}`);
+        if (detalleRaw) break;
 
-        if (detalleResp.status() === 200) {
-          detalleRaw = await detalleResp.json() as Record<string, unknown>;
-          console.log(`[fetchRCV] detalleRaw keys: ${Object.keys(detalleRaw)}, snippet: ${JSON.stringify(detalleRaw).slice(0, 200)}`);
-          break;
-        }
-
-        const errBody = await detalleResp.text().catch(() => "");
-        console.warn(`[fetchRCV] SII devolvió ${detalleResp.status()} en getDetalle (intento ${intento}): ${errBody.slice(0, 100)}`);
+        console.warn(`[fetchRCV] SII devolvió ${detalleStatus} en getDetalle (intento ${intento})`);
         if (intento < 3) await new Promise((r) => setTimeout(r, 3000));
       }
 
@@ -391,7 +391,7 @@ async function fetchRCV(
       detalles = parseRcvDetailsFromJson(detalleRaw, operacion);
     }
 
-    // 6. Construir respuesta
+    // 7. Construir respuesta
     const monthNames = ["---", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
       "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
 
@@ -409,7 +409,9 @@ async function fetchRCV(
     return { caratula, ventas: { resumenes: summaries, detalleVentas: detalles } };
 
   } finally {
-    await browser.close();
+    // Ignorar errores al cerrar: el portal SII puede tener navegaciones Angular pendientes
+    // que generan "Navigation timeout" al cerrar el browser, matando el return exitoso.
+    try { await browser.close(); } catch { /* intentional */ }
     cleanupSession(sessionId);
   }
 }
