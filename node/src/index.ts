@@ -11,6 +11,7 @@ import rateLimit from "express-rate-limit";
 dotenv.config();
 
 const app: Express = express();
+app.set("trust proxy", 1);
 app.use(express.json({ limit: "10kb" }));
 
 const port            = process.env.PORT || 3000;
@@ -342,16 +343,18 @@ async function fetchRCV(
     const clickDescargarDetalles = () => page.evaluate(() => {
       const isDetalles = (b: Element) => /descargar\s*det/i.test(b.textContent?.trim() ?? "");
       const allBtns = Array.from(document.querySelectorAll("button"));
+      const allBtnTexts = allBtns.map((b) => b.textContent?.trim() ?? "").filter(Boolean);
+      console.log("[page] botones disponibles:", JSON.stringify(allBtnTexts));
       const activePane = document.querySelector(".tab-pane.active");
       if (activePane) {
         const btn = Array.from(activePane.querySelectorAll("button")).find(isDetalles);
-        if (btn) { (btn as HTMLButtonElement).click(); return true; }
+        if (btn) { (btn as HTMLButtonElement).click(); return "active-pane"; }
       }
       const visible = allBtns.find((b) => isDetalles(b) && (b as HTMLElement).offsetParent !== null);
-      if (visible) { visible.click(); return true; }
+      if (visible) { visible.click(); return "visible"; }
       const any = allBtns.find(isDetalles);
-      if (any) { any.click(); return true; }
-      return false;
+      if (any) { any.click(); return "any"; }
+      return null;
     });
 
     let detalles: object[] = [];
@@ -359,12 +362,19 @@ async function fetchRCV(
       let detalleRaw: Record<string, unknown> | null = null;
 
       for (let intento = 1; intento <= 3; intento++) {
-        const [detalleResp] = await Promise.all([
-          page.waitForResponse((r) => r.url().includes("getDetalle"), { timeout: PAGE_TIMEOUT_MS }),
-          clickDescargarDetalles(),
-        ]);
+        const responsePromise = page.waitForResponse(
+          (r) => r.url().includes("getDetalle") || r.url().includes("Detalle"),
+          { timeout: PAGE_TIMEOUT_MS }
+        );
+        const clickResult = await clickDescargarDetalles();
+        console.log(`[fetchRCV] intento ${intento}: clickDescargarDetalles → ${clickResult}`);
 
-        console.log(`[fetchRCV] intento ${intento}: getDetalle → ${detalleResp.status()} ${detalleResp.url()}`);
+        if (!clickResult) {
+          throw new Error("No se encontró el botón 'Descargar Detalles' en el portal SII.");
+        }
+
+        const detalleResp = await responsePromise;
+        console.log(`[fetchRCV] intento ${intento}: response → ${detalleResp.status()} ${detalleResp.url()}`);
 
         if (detalleResp.status() === 200) {
           detalleRaw = await detalleResp.json() as Record<string, unknown>;
