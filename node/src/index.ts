@@ -14,8 +14,9 @@ const app: Express = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "10kb" }));
 
-const port            = process.env.PORT || 3000;
-const PAGE_TIMEOUT_MS = 120_000;
+const port               = process.env.PORT || 3000;
+const PAGE_TIMEOUT_MS    = 120_000;
+const REQUEST_TIMEOUT_MS = 180_000;
 
 // ─── Manejadores de errores de proceso ───────────────────────────────────────
 
@@ -98,6 +99,47 @@ async function login(page: Page, user: string, pass: string): Promise<void> {
   ]);
   if (page.url().includes("zeusr.sii.cl")) {
     throw new Error("Credenciales SII inválidas o servicio no disponible");
+  }
+}
+
+// El SII mantiene la sesión activa en su servidor aunque cerremos el browser.
+// Sin este logout explícito, tras un par de consultas con el mismo RUT el SII
+// bloquea la clave por "múltiples sesiones concurrentes". Best-effort: nunca
+// debe tumbar la respuesta ya construida, por eso todos los timeouts son cortos
+// y los errores se tragan.
+async function logout(page: Page): Promise<void> {
+  try {
+    await page.goto("https://misiir.sii.cl/cgi_misii/siihome.cgi", {
+      waitUntil: "domcontentloaded",
+      timeout: 15_000,
+    });
+    const clicked = await page.evaluate(() => {
+      const links = Array.from(document.querySelectorAll("a"));
+      const exit = links.find((a) => /cerrar\s*sesi|salir del sitio/i.test(a.textContent?.trim() ?? ""));
+      if (exit) { (exit as HTMLAnchorElement).click(); return true; }
+      return false;
+    });
+    if (clicked) {
+      await page.waitForNavigation({ timeout: 15_000 }).catch(() => {});
+    }
+    console.log(`[logout] sesión SII cerrada: ${clicked ? "ok" : "enlace no encontrado"}`);
+  } catch (e) {
+    console.warn("[logout] No se pudo cerrar sesión SII:", (e as Error).message);
+  }
+}
+
+// Garantiza que el cliente HTTP siempre recibe respuesta, incluso si Puppeteer
+// se cuelga internamente. La promesa original sigue corriendo en segundo plano
+// (su propio finally igual cierra el browser); solo dejamos de esperarla aquí.
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Tiempo máximo excedido en: ${label}`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer!);
   }
 }
 
@@ -231,11 +273,13 @@ async function fetchRCV(
   const rutNum      = user.split("-")[0];
   const dv          = user.split("-")[1];
 
-  const sessionId = randomUUID();
-  const browser   = await launchBrowser(sessionId);
+  const sessionId  = randomUUID();
+  const browser    = await launchBrowser(sessionId);
+  let pageRef: Page | null = null;
 
   try {
     const page = await browser.newPage();
+    pageRef = page;
 
     // Todos los acumuladores se llenan via page.on("response") antes de cualquier navegación
     // para evitar race conditions donde la respuesta llega antes de registrar waitForResponse.
@@ -411,6 +455,7 @@ async function fetchRCV(
   } finally {
     // Ignorar errores al cerrar: el portal SII puede tener navegaciones Angular pendientes
     // que generan "Navigation timeout" al cerrar el browser, matando el return exitoso.
+    if (pageRef) await logout(pageRef);
     try { await browser.close(); } catch { /* intentional */ }
     cleanupSession(sessionId);
   }
@@ -452,20 +497,13 @@ function getRcvCredentialsFromBody(
 
 // ─── Endpoints ───────────────────────────────────────────────────────────────
 
-app.post("/getEstadoF29", requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
-  const { rut, pass } = req.body as { rut?: string; pass?: string };
-  if (!rut || !pass) {
-    res.status(400).json({ error: "Se requieren los campos 'rut' y 'pass' en el body." });
-    return;
-  }
-  if (!RUT_REGEX.test(rut)) {
-    res.status(400).json({ error: "Formato de RUT inválido. Use el formato: 12345678-9" });
-    return;
-  }
+async function fetchEstadoF29(rut: string, pass: string): Promise<object> {
   const sessionId = randomUUID();
   const browser = await launchBrowser(sessionId);
+  let pageRef: Page | null = null;
   try {
     const page = await browser.newPage();
+    pageRef = page;
     await login(page, rut, pass);
     await page.goto(
       "https://www4.sii.cl/sifmConsultaInternet/index.html?dest=cifxx&form=29",
@@ -507,15 +545,32 @@ app.post("/getEstadoF29", requireApiKey, heavyLimiter, async (req: Request, res:
       }
     }
 
-    res.json({ data });
+    return { data };
+  } finally {
+    if (pageRef) await logout(pageRef);
+    try { await browser.close(); } catch { /* intentional */ }
+    cleanupSession(sessionId);
+  }
+}
+
+app.post("/getEstadoF29", requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
+  const { rut, pass } = req.body as { rut?: string; pass?: string };
+  if (!rut || !pass) {
+    res.status(400).json({ error: "Se requieren los campos 'rut' y 'pass' en el body." });
+    return;
+  }
+  if (!RUT_REGEX.test(rut)) {
+    res.status(400).json({ error: "Formato de RUT inválido. Use el formato: 12345678-9" });
+    return;
+  }
+  try {
+    const data = await withTimeout(fetchEstadoF29(rut, pass), REQUEST_TIMEOUT_MS, "consulta Estado F29");
+    res.json(data);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
     console.error("[/getEstadoF29] Error:", message);
     const status = message.includes("inválidas") ? 401 : 500;
     res.status(status).json({ error: message });
-  } finally {
-    await browser.close();
-    cleanupSession(sessionId);
   }
 });
 
@@ -526,7 +581,11 @@ app.post("/api/RCV/compras/:month/:year", requireApiKey, heavyLimiter, async (re
   if (!creds) return;
   const detallado = !!req.body.Detallado;
   try {
-    const data = await fetchRCV(month, year, creds.user, creds.pass, "compras", detallado);
+    const data = await withTimeout(
+      fetchRCV(month, year, creds.user, creds.pass, "compras", detallado),
+      REQUEST_TIMEOUT_MS,
+      "consulta RCV compras"
+    );
     res.json(data);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
@@ -543,7 +602,11 @@ app.post("/api/RCV/ventas/:month/:year", requireApiKey, heavyLimiter, async (req
   if (!creds) return;
   const detallado = !!req.body.Detallado;
   try {
-    const data = await fetchRCV(month, year, creds.user, creds.pass, "ventas", detallado);
+    const data = await withTimeout(
+      fetchRCV(month, year, creds.user, creds.pass, "ventas", detallado),
+      REQUEST_TIMEOUT_MS,
+      "consulta RCV ventas"
+    );
     res.json(data);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
