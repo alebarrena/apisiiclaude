@@ -60,6 +60,26 @@ const heavyLimiter = rateLimit({
   message: { error: "Demasiadas solicitudes. Espere un momento antes de intentarlo de nuevo." },
 });
 
+// El SII aplica throttling anti-bot cuando detecta logins muy seguidos con el mismo RUT:
+// el redirect post-login se cuelga ~120s en vez de fallar limpio. Forzamos un cooldown
+// por RUT para nunca disparar esa protección.
+const RUT_COOLDOWN_MS = 30_000;
+const lastQueryByRut = new Map<string, number>();
+
+function checkRutCooldown(rut: string, res: Response): boolean {
+  const last = lastQueryByRut.get(rut);
+  const now = Date.now();
+  if (last !== undefined && now - last < RUT_COOLDOWN_MS) {
+    const waitSec = Math.ceil((RUT_COOLDOWN_MS - (now - last)) / 1000);
+    res.status(429).json({
+      error: `Debe esperar ${waitSec}s antes de consultar nuevamente este RUT. El SII bloquea logins muy seguidos.`,
+    });
+    return false;
+  }
+  lastQueryByRut.set(rut, now);
+  return true;
+}
+
 // ─── Helpers de browser ──────────────────────────────────────────────────────
 
 function sessionDir(sessionId: string): string {
@@ -563,6 +583,7 @@ app.post("/getEstadoF29", requireApiKey, heavyLimiter, async (req: Request, res:
     res.status(400).json({ error: "Formato de RUT inválido. Use el formato: 12345678-9" });
     return;
   }
+  if (!checkRutCooldown(rut, res)) return;
   try {
     const data = await withTimeout(fetchEstadoF29(rut, pass), REQUEST_TIMEOUT_MS, "consulta Estado F29");
     res.json(data);
@@ -579,6 +600,7 @@ app.post("/api/RCV/compras/:month/:year", requireApiKey, heavyLimiter, async (re
   if (!validateRcvParams(month, year, res)) return;
   const creds = getRcvCredentialsFromBody(req.body, res);
   if (!creds) return;
+  if (!checkRutCooldown(creds.user, res)) return;
   const detallado = !!req.body.Detallado;
   try {
     const data = await withTimeout(
@@ -600,6 +622,7 @@ app.post("/api/RCV/ventas/:month/:year", requireApiKey, heavyLimiter, async (req
   if (!validateRcvParams(month, year, res)) return;
   const creds = getRcvCredentialsFromBody(req.body, res);
   if (!creds) return;
+  if (!checkRutCooldown(creds.user, res)) return;
   const detallado = !!req.body.Detallado;
   try {
     const data = await withTimeout(
