@@ -481,6 +481,166 @@ async function fetchRCV(
   }
 }
 
+// ─── Lógica Boletas de Honorarios (recibidas) ────────────────────────────────
+
+const ESTADO_BHE_MAP: Record<string, string> = {
+  N: "VIGENTE",
+  S: "ANULADA",
+  V: "VIGENTE_ANULACION_PENDIENTE",
+  R: "OBSERVADA_RECEPTOR",
+  U: "OBSERVADA_UNIDAD",
+};
+
+function parseMontoBHE(v: unknown): number {
+  return Number(String(v ?? "0").replace(/\./g, "")) || 0;
+}
+
+interface BoletaRecibidaRaw {
+  folio: string;
+  estado: string;
+  fechaAnulacion: string;
+  fecha: string;
+  rutEmisor: string;
+  nombreEmisor: string;
+  sociedadProfesional: boolean;
+  montoBruto: string;
+  montoRetenido: string;
+  montoLiquido: string;
+}
+
+interface InformeMensualBHE {
+  rut: string;
+  contribuyente: string;
+  totalBoletas: string;
+  totalHonorarios: string;
+  totalRetencion: string;
+  totalLiquido: string;
+  paginaActual: string;
+  boletas: BoletaRecibidaRaw[];
+}
+
+// El informe se renderiza en el cliente vía document.write() a partir de variables
+// globales (xml_values / arr_informe_mensual) inyectadas por el SII en un <script>.
+// Leerlas directamente evita parsear el HTML/tablas ya renderizadas.
+function extractInformeMensualBHE(page: Page): Promise<InformeMensualBHE> {
+  return page.evaluate(() => {
+    const xv = (window as any).xml_values ?? {};
+    const arr = (window as any).arr_informe_mensual ?? {};
+    const cantidadFilas = Number((window as any).CantidadFilas || 0);
+    const boletas = [];
+    for (let i = 1; i <= cantidadFilas; i++) {
+      boletas.push({
+        folio: arr["nroboleta_" + i],
+        estado: arr["estado_" + i],
+        fechaAnulacion: (arr["fechaanulacion_" + i] || "").trim(),
+        fecha: arr["fecha_boleta_" + i],
+        rutEmisor: `${arr["rutemisor_" + i]}-${arr["dvemisor_" + i]}`,
+        nombreEmisor: (arr["nombre_emisor_" + i] || "").trim(),
+        sociedadProfesional: arr["es_soc_profesional_" + i] === "SI",
+        montoBruto: arr["totalhonorarios_" + i],
+        montoRetenido: arr["retencion_receptor_" + i],
+        montoLiquido: arr["honorariosliquidos_" + i],
+      });
+    }
+    return {
+      rut: `${xv["rut_arrastre"]}-${xv["dv_arrastre"]}`,
+      contribuyente: xv["nombre_contribuyente"],
+      totalBoletas: xv["total_boletas"],
+      totalHonorarios: xv["suma_honorarios"],
+      totalRetencion: xv["suma_retencion_receptor"],
+      totalLiquido: xv["suma_liquido"],
+      paginaActual: xv["pagina_actual"],
+      boletas,
+    };
+  });
+}
+
+async function fetchBoletasHonorariosRecibidas(
+  month: string,
+  year: string,
+  user: string,
+  pass: string
+): Promise<object> {
+  const sessionId = randomUUID();
+  const browser = await launchBrowser(sessionId);
+  let pageRef: Page | null = null;
+
+  try {
+    const page = await browser.newPage();
+    pageRef = page;
+
+    await login(page, user, pass);
+
+    await page.goto(
+      `https://loa.sii.cl/cgi_IMT/TMBCOC_MenuConsultasContribRec.cgi?dummy=${Date.now()}`,
+      { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT_MS }
+    );
+    await page.waitForSelector("select[name='cbmesinformemensual']", { timeout: PAGE_TIMEOUT_MS });
+    await page.select("select[name='cbmesinformemensual']", month.padStart(2, "0"));
+    await page.select("select[name='cbanoinformemensual']", year);
+
+    await Promise.all([
+      page.waitForNavigation({ timeout: PAGE_TIMEOUT_MS }),
+      page.click('input[name="cmdconsultar1"][onclick*="validar_mensual"]'),
+    ]);
+    await page.waitForFunction(() => typeof (window as any).xml_values !== "undefined", {
+      timeout: PAGE_TIMEOUT_MS,
+    });
+
+    let informe = await extractInformeMensualBHE(page);
+    const boletasRaw: BoletaRecibidaRaw[] = [...informe.boletas];
+
+    // El SII pagina de a 100 filas (MAXFILAS); listar(n) es la función embebida
+    // en la página que resubmite el formulario pidiendo la página n.
+    const totalPaginas = Math.ceil((Number(informe.totalBoletas) || 0) / 100) || 1;
+    while (Number(informe.paginaActual) < totalPaginas) {
+      const siguiente = Number(informe.paginaActual) + 1;
+      await Promise.all([
+        page.waitForNavigation({ timeout: PAGE_TIMEOUT_MS }),
+        page.evaluate((p) => (window as any).listar(p), siguiente),
+      ]);
+      await page.waitForFunction(() => typeof (window as any).xml_values !== "undefined", {
+        timeout: PAGE_TIMEOUT_MS,
+      });
+      informe = await extractInformeMensualBHE(page);
+      boletasRaw.push(...informe.boletas);
+    }
+
+    const boletas = boletasRaw.map((b) => ({
+      folio: b.folio,
+      estado: ESTADO_BHE_MAP[b.estado] ?? b.estado,
+      fechaAnulacion: b.fechaAnulacion || null,
+      fecha: b.fecha,
+      rutEmisor: b.rutEmisor,
+      nombreEmisor: b.nombreEmisor,
+      sociedadProfesional: b.sociedadProfesional,
+      montoBruto: parseMontoBHE(b.montoBruto),
+      montoRetenido: parseMontoBHE(b.montoRetenido),
+      montoLiquido: parseMontoBHE(b.montoLiquido),
+    }));
+
+    return {
+      caratula: {
+        rutContribuyente: informe.rut,
+        nombreContribuyente: informe.contribuyente,
+        mes: month,
+        anio: year,
+      },
+      resumen: {
+        totalBoletas: Number(informe.totalBoletas) || 0,
+        totalHonorarios: parseMontoBHE(informe.totalHonorarios),
+        totalRetencion: parseMontoBHE(informe.totalRetencion),
+        totalLiquido: parseMontoBHE(informe.totalLiquido),
+      },
+      boletas,
+    };
+  } finally {
+    if (pageRef) await logout(pageRef);
+    try { await browser.close(); } catch { /* intentional */ }
+    cleanupSession(sessionId);
+  }
+}
+
 // ─── Validación ──────────────────────────────────────────────────────────────
 
 const RUT_REGEX   = /^\d{1,8}-[\dkK]$/;
@@ -634,6 +794,27 @@ app.post("/api/RCV/ventas/:month/:year", requireApiKey, heavyLimiter, async (req
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
     console.error("[/api/RCV/ventas] Error:", message);
+    const status = message.includes("inválidas") ? 401 : 500;
+    res.status(status).json({ error: message });
+  }
+});
+
+app.post("/api/boletas/recibidas/:month/:year", requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
+  const { month, year } = req.params;
+  if (!validateRcvParams(month, year, res)) return;
+  const creds = getRcvCredentialsFromBody(req.body, res);
+  if (!creds) return;
+  if (!checkRutCooldown(creds.user, res)) return;
+  try {
+    const data = await withTimeout(
+      fetchBoletasHonorariosRecibidas(month, year, creds.user, creds.pass),
+      REQUEST_TIMEOUT_MS,
+      "consulta boletas honorarios recibidas"
+    );
+    res.json(data);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Error desconocido";
+    console.error("[/api/boletas/recibidas] Error:", message);
     const status = message.includes("inválidas") ? 401 : 500;
     res.status(status).json({ error: message });
   }

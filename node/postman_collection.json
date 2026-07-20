@@ -76,6 +76,23 @@
       }
     },
     {
+      "name": "Boletas Honorarios Recibidas — Por Mes",
+      "request": {
+        "method": "POST",
+        "url": "{{base_url}}/api/boletas/recibidas/04/2025",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"rut\": \"REEMPLAZAR_RUT\",\n  \"pass\": \"REEMPLAZAR_PASS\"\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "description": "Informe mensual de boletas de honorarios RECIBIDAS por el RUT indicado. Parámetros en la URL: /recibidas/{mes}/{año}. Credenciales van en el body."
+      }
+    },
+    {
       "name": "[Error] Sin API Key",
       "request": {
         "method": "GET",
