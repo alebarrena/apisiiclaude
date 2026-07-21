@@ -46,6 +46,8 @@ jobs:
                 image: abarrenaprisma/sii-api:latest
                 container_name: sii-api
                 restart: unless-stopped
+                mem_limit: 1g
+                cpus: 1.5
                 ports:
                   - "127.0.0.1:3000:3000"
                 env_file:

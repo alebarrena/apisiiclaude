@@ -5,13 +5,18 @@ import { parse } from "node-html-parser";
 import path from "path";
 import os from "node:os";
 import fs from "node:fs";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import rateLimit from "express-rate-limit";
+import helmet from "helmet";
 
 dotenv.config();
 
 const app: Express = express();
 app.set("trust proxy", 1);
+// Cabeceras de seguridad estándar (X-Content-Type-Options, X-Frame-Options, quita
+// X-Powered-By, etc). Es una API JSON pura, así que ninguna de estas cabeceras
+// afecta el body ni el status de las respuestas existentes.
+app.use(helmet());
 app.use(express.json({ limit: "10kb" }));
 
 const port               = process.env.PORT || 3000;
@@ -36,6 +41,34 @@ process.on("uncaughtException", (err: NodeJS.ErrnoException) => {
 
 // ─── Autenticación ───────────────────────────────────────────────────────────
 
+// Comparación constant-time: evita filtrar por timing cuántos caracteres iniciales
+// de la key coinciden. Buffer.from(a).length !== Buffer.from(b).length ya corta
+// antes de llamar a timingSafeEqual (que exige igual longitud), sin comparar contenido.
+function safeCompare(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+// Contador de intentos fallidos de API key por IP. Solo se toca en el branch de
+// rechazo: un cliente con la key correcta nunca pasa por acá, así que esto no
+// afecta a ningún consumidor legítimo — solo frena el escaneo/fuerza bruta de la key.
+const AUTH_FAIL_WINDOW_MS = 60_000;
+const AUTH_FAIL_MAX = 20;
+const authFailuresByIp = new Map<string, { count: number; windowStart: number }>();
+
+function registerAuthFailure(ip: string): boolean {
+  const now = Date.now();
+  const entry = authFailuresByIp.get(ip);
+  if (!entry || now - entry.windowStart > AUTH_FAIL_WINDOW_MS) {
+    authFailuresByIp.set(ip, { count: 1, windowStart: now });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= AUTH_FAIL_MAX;
+}
+
 function requireApiKey(req: Request, res: Response, next: NextFunction): void {
   const apiKey = process.env.API_KEY;
   if (!apiKey) {
@@ -43,7 +76,11 @@ function requireApiKey(req: Request, res: Response, next: NextFunction): void {
     return;
   }
   const provided = req.headers["x-api-key"];
-  if (!provided || provided !== apiKey) {
+  if (typeof provided !== "string" || !safeCompare(provided, apiKey)) {
+    if (!registerAuthFailure(req.ip ?? "unknown")) {
+      res.status(429).json({ error: "Demasiados intentos con API key inválida. Intente más tarde." });
+      return;
+    }
     res.status(401).json({ error: "API key inválida o ausente" });
     return;
   }
@@ -80,6 +117,55 @@ function checkRutCooldown(rut: string, res: Response): boolean {
   return true;
 }
 
+// Ambos Map (cooldown por RUT y fallos de auth por IP) solo crecen; sin esta
+// limpieza periódica acumulan entradas para siempre en un proceso de larga duración.
+setInterval(() => {
+  const now = Date.now();
+  for (const [rut, ts] of lastQueryByRut) {
+    if (now - ts > RUT_COOLDOWN_MS) lastQueryByRut.delete(rut);
+  }
+  for (const [ip, entry] of authFailuresByIp) {
+    if (now - entry.windowStart > AUTH_FAIL_WINDOW_MS) authFailuresByIp.delete(ip);
+  }
+}, 5 * 60_000).unref();
+
+// ─── Control de concurrencia ─────────────────────────────────────────────────
+
+// Cada request pesado abre un Chromium completo. Sin este límite, N requests
+// simultáneos lanzan N navegadores sin techo, arriesgando OOM en la VPS (compartida
+// con otros proyectos). El request que excede el cupo simplemente espera en cola;
+// si la espera + el resto del trabajo supera REQUEST_TIMEOUT_MS, falla con el mismo
+// error de timeout que ya existía (withTimeout), sin cambiar el contrato de la API.
+const MAX_CONCURRENT_SESSIONS = Number(process.env.MAX_CONCURRENT_SESSIONS) || 2;
+
+class Semaphore {
+  private available: number;
+  private queue: (() => void)[] = [];
+
+  constructor(count: number) {
+    this.available = count;
+  }
+
+  async acquire(): Promise<void> {
+    if (this.available > 0) {
+      this.available--;
+      return;
+    }
+    await new Promise<void>((resolve) => this.queue.push(resolve));
+  }
+
+  release(): void {
+    const next = this.queue.shift();
+    if (next) {
+      next();
+    } else {
+      this.available++;
+    }
+  }
+}
+
+const sessionSemaphore = new Semaphore(MAX_CONCURRENT_SESSIONS);
+
 // ─── Helpers de browser ──────────────────────────────────────────────────────
 
 function sessionDir(sessionId: string): string {
@@ -90,7 +176,13 @@ function launchBrowser(sessionId: string): Promise<Browser> {
   return puppeteer.launch({
     headless: true,
     executablePath: executablePath(),
-    args: ["--disable-setuid-sandbox", "--no-sandbox", "--disable-gpu", "--no-first-run"],
+    args: [
+      "--disable-setuid-sandbox",
+      "--no-sandbox",
+      "--disable-gpu",
+      "--no-first-run",
+      "--disable-dev-shm-usage",
+    ],
     userDataDir: sessionDir(sessionId),
   });
 }
@@ -160,6 +252,22 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
     return await Promise.race([promise, timeout]);
   } finally {
     clearTimeout(timer!);
+  }
+}
+
+const BROWSER_CLOSE_TIMEOUT_MS = 10_000;
+
+// El SII a veces deja navegaciones Angular pendientes que cuelgan browser.close()
+// indefinidamente (nunca resuelve ni rechaza). Sin este timeout, esa espera colgada
+// retiene el proceso Chromium y su sesión en disco para siempre, filtrando recursos
+// bajo carga sostenida. Esto corre en el finally, después de responder al cliente:
+// no cambia la respuesta HTTP en ningún caso.
+async function closeBrowserSafely(browser: Browser, label: string): Promise<void> {
+  try {
+    await withTimeout(browser.close(), BROWSER_CLOSE_TIMEOUT_MS, label);
+  } catch (e) {
+    console.warn(`[${label}] browser.close() no respondió, forzando kill:`, (e as Error).message);
+    try { browser.process()?.kill("SIGKILL"); } catch { /* intentional */ }
   }
 }
 
@@ -293,6 +401,7 @@ async function fetchRCV(
   const rutNum      = user.split("-")[0];
   const dv          = user.split("-")[1];
 
+  await sessionSemaphore.acquire();
   const sessionId  = randomUUID();
   const browser    = await launchBrowser(sessionId);
   let pageRef: Page | null = null;
@@ -476,8 +585,9 @@ async function fetchRCV(
     // Ignorar errores al cerrar: el portal SII puede tener navegaciones Angular pendientes
     // que generan "Navigation timeout" al cerrar el browser, matando el return exitoso.
     if (pageRef) await logout(pageRef);
-    try { await browser.close(); } catch { /* intentional */ }
+    await closeBrowserSafely(browser, "cierre navegador RCV");
     cleanupSession(sessionId);
+    sessionSemaphore.release();
   }
 }
 
@@ -561,6 +671,7 @@ async function fetchBoletasHonorariosRecibidas(
   user: string,
   pass: string
 ): Promise<object> {
+  await sessionSemaphore.acquire();
   const sessionId = randomUUID();
   const browser = await launchBrowser(sessionId);
   let pageRef: Page | null = null;
@@ -636,8 +747,9 @@ async function fetchBoletasHonorariosRecibidas(
     };
   } finally {
     if (pageRef) await logout(pageRef);
-    try { await browser.close(); } catch { /* intentional */ }
+    await closeBrowserSafely(browser, "cierre navegador boletas honorarios");
     cleanupSession(sessionId);
+    sessionSemaphore.release();
   }
 }
 
@@ -678,6 +790,7 @@ function getRcvCredentialsFromBody(
 // ─── Endpoints ───────────────────────────────────────────────────────────────
 
 async function fetchEstadoF29(rut: string, pass: string): Promise<object> {
+  await sessionSemaphore.acquire();
   const sessionId = randomUUID();
   const browser = await launchBrowser(sessionId);
   let pageRef: Page | null = null;
@@ -728,8 +841,9 @@ async function fetchEstadoF29(rut: string, pass: string): Promise<object> {
     return { data };
   } finally {
     if (pageRef) await logout(pageRef);
-    try { await browser.close(); } catch { /* intentional */ }
+    await closeBrowserSafely(browser, "cierre navegador F29");
     cleanupSession(sessionId);
+    sessionSemaphore.release();
   }
 }
 
