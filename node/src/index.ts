@@ -1,6 +1,6 @@
 import express, { Express, NextFunction, Request, Response } from "express";
 import dotenv from "dotenv";
-import puppeteer, { Browser, executablePath, Page } from "puppeteer";
+import puppeteer, { Browser, executablePath, HTTPResponse, Page } from "puppeteer";
 import { parse } from "node-html-parser";
 import path from "path";
 import os from "node:os";
@@ -104,6 +104,14 @@ const RUT_COOLDOWN_MS = 30_000;
 const lastQueryByRut = new Map<string, number>();
 
 function checkRutCooldown(rut: string, res: Response): boolean {
+  // Un lote en curso mantiene una sesión SII abierta con este RUT: abrir otra a la vez
+  // haría que el SII bloquee la clave por sesiones concurrentes.
+  if (lotesActivosPorRut.has(rut)) {
+    res.status(409).json({
+      error: "Hay un lote en curso para este RUT. Espere a que termine antes de iniciar otra consulta.",
+    });
+    return false;
+  }
   const last = lastQueryByRut.get(rut);
   const now = Date.now();
   if (last !== undefined && now - last < RUT_COOLDOWN_MS) {
@@ -422,21 +430,30 @@ async function fetchRCV(
   mode: "compras" | "ventas",
   detallado = false
 ): Promise<object> {
+  return conSesionSii("RCV", user, pass, (page) =>
+    descargarRCV(page, month, year, user, mode, detallado)
+  );
+}
+
+// Descarga el RCV con una página ya autenticada (la usa tanto el endpoint suelto como
+// el lote). El listener de respuestas se retira al terminar para que varias descargas
+// seguidas en la misma página no acumulen listeners ni respuestas de otra consulta.
+async function descargarRCV(
+  page: Page,
+  month: string,
+  year: string,
+  user: string,
+  mode: "compras" | "ventas",
+  detallado = false
+): Promise<object> {
   const operacion   = mode === "compras" ? "COMPRA" : "VENTA";
   const ptributario = year + month.padStart(2, "0");
   const rutNum      = user.split("-")[0];
   const dv          = user.split("-")[1];
 
-  await sessionSemaphore.acquire();
-  const sessionId  = randomUUID();
-  let browser: Browser | null = null;
-  let pageRef: Page | null = null;
+  let onResponse: ((r: HTTPResponse) => Promise<void>) | null = null;
 
   try {
-    browser = await launchBrowser(sessionId);
-    const page = await browser.newPage();
-    pageRef = page;
-
     // Todos los acumuladores se llenan via page.on("response") antes de cualquier navegación
     // para evitar race conditions donde la respuesta llega antes de registrar waitForResponse.
     const resumenResponses: Record<string, unknown>[] = [];
@@ -444,7 +461,7 @@ async function fetchRCV(
     let detalleRaw: Record<string, unknown> | null = null;
     let detalleStatus = 0;
 
-    page.on("response", async (r) => {
+    onResponse = async (r: HTTPResponse) => {
       const url = r.url();
       if (url.includes("sii.cl") && url.includes("services")) {
         console.log(`[net] ${r.status()} ${r.request().method()} ${url}`);
@@ -476,10 +493,8 @@ async function fetchRCV(
           }
         }
       }
-    });
-
-    // 1. Login
-    await login(page, user, pass);
+    };
+    page.on("response", onResponse);
 
     // 2. Navegar al portal RCV
     await page.goto("https://www4.sii.cl/consdcvinternetui/", {
@@ -611,12 +626,7 @@ async function fetchRCV(
     return { caratula, ventas: { resumenes: summaries, detalleVentas: detalles } };
 
   } finally {
-    // Ignorar errores al cerrar: el portal SII puede tener navegaciones Angular pendientes
-    // que generan "Navigation timeout" al cerrar el browser, matando el return exitoso.
-    if (pageRef) await logout(pageRef);
-    if (browser) await closeBrowserSafely(browser, "cierre navegador RCV");
-    cleanupSession(sessionId);
-    sessionSemaphore.release();
+    if (onResponse) page.off("response", onResponse);
   }
 }
 
@@ -700,87 +710,76 @@ async function fetchBoletasHonorariosRecibidas(
   user: string,
   pass: string
 ): Promise<object> {
-  await sessionSemaphore.acquire();
-  const sessionId = randomUUID();
-  let browser: Browser | null = null;
-  let pageRef: Page | null = null;
+  return conSesionSii("boletas honorarios", user, pass, (page) =>
+    descargarBHE(page, month, year)
+  );
+}
 
-  try {
-    browser = await launchBrowser(sessionId);
-    const page = await browser.newPage();
-    pageRef = page;
+// Descarga el informe mensual de BHE recibidas con una página ya autenticada.
+async function descargarBHE(page: Page, month: string, year: string): Promise<object> {
+  await page.goto(
+    `https://loa.sii.cl/cgi_IMT/TMBCOC_MenuConsultasContribRec.cgi?dummy=${Date.now()}`,
+    { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT_MS }
+  );
+  await page.waitForSelector("select[name='cbmesinformemensual']", { timeout: PAGE_TIMEOUT_MS });
+  await page.select("select[name='cbmesinformemensual']", month.padStart(2, "0"));
+  await page.select("select[name='cbanoinformemensual']", year);
 
-    await login(page, user, pass);
+  await Promise.all([
+    page.waitForNavigation({ timeout: PAGE_TIMEOUT_MS }),
+    page.click('input[name="cmdconsultar1"][onclick*="validar_mensual"]'),
+  ]);
+  await page.waitForFunction(() => typeof (window as any).xml_values !== "undefined", {
+    timeout: PAGE_TIMEOUT_MS,
+  });
 
-    await page.goto(
-      `https://loa.sii.cl/cgi_IMT/TMBCOC_MenuConsultasContribRec.cgi?dummy=${Date.now()}`,
-      { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT_MS }
-    );
-    await page.waitForSelector("select[name='cbmesinformemensual']", { timeout: PAGE_TIMEOUT_MS });
-    await page.select("select[name='cbmesinformemensual']", month.padStart(2, "0"));
-    await page.select("select[name='cbanoinformemensual']", year);
+  let informe = await extractInformeMensualBHE(page);
+  const boletasRaw: BoletaRecibidaRaw[] = [...informe.boletas];
 
+  // El SII pagina de a 100 filas (MAXFILAS); listar(n) es la función embebida
+  // en la página que resubmite el formulario pidiendo la página n.
+  const totalPaginas = Math.ceil((Number(informe.totalBoletas) || 0) / 100) || 1;
+  while (Number(informe.paginaActual) < totalPaginas) {
+    const siguiente = Number(informe.paginaActual) + 1;
     await Promise.all([
       page.waitForNavigation({ timeout: PAGE_TIMEOUT_MS }),
-      page.click('input[name="cmdconsultar1"][onclick*="validar_mensual"]'),
+      page.evaluate((p) => (window as any).listar(p), siguiente),
     ]);
     await page.waitForFunction(() => typeof (window as any).xml_values !== "undefined", {
       timeout: PAGE_TIMEOUT_MS,
     });
-
-    let informe = await extractInformeMensualBHE(page);
-    const boletasRaw: BoletaRecibidaRaw[] = [...informe.boletas];
-
-    // El SII pagina de a 100 filas (MAXFILAS); listar(n) es la función embebida
-    // en la página que resubmite el formulario pidiendo la página n.
-    const totalPaginas = Math.ceil((Number(informe.totalBoletas) || 0) / 100) || 1;
-    while (Number(informe.paginaActual) < totalPaginas) {
-      const siguiente = Number(informe.paginaActual) + 1;
-      await Promise.all([
-        page.waitForNavigation({ timeout: PAGE_TIMEOUT_MS }),
-        page.evaluate((p) => (window as any).listar(p), siguiente),
-      ]);
-      await page.waitForFunction(() => typeof (window as any).xml_values !== "undefined", {
-        timeout: PAGE_TIMEOUT_MS,
-      });
-      informe = await extractInformeMensualBHE(page);
-      boletasRaw.push(...informe.boletas);
-    }
-
-    const boletas = boletasRaw.map((b) => ({
-      folio: b.folio,
-      estado: ESTADO_BHE_MAP[b.estado] ?? b.estado,
-      fechaAnulacion: b.fechaAnulacion || null,
-      fecha: b.fecha,
-      rutEmisor: b.rutEmisor,
-      nombreEmisor: b.nombreEmisor,
-      sociedadProfesional: b.sociedadProfesional,
-      montoBruto: parseMontoBHE(b.montoBruto),
-      montoRetenido: parseMontoBHE(b.montoRetenido),
-      montoLiquido: parseMontoBHE(b.montoLiquido),
-    }));
-
-    return {
-      caratula: {
-        rutContribuyente: informe.rut,
-        nombreContribuyente: informe.contribuyente,
-        mes: month,
-        anio: year,
-      },
-      resumen: {
-        totalBoletas: Number(informe.totalBoletas) || 0,
-        totalHonorarios: parseMontoBHE(informe.totalHonorarios),
-        totalRetencion: parseMontoBHE(informe.totalRetencion),
-        totalLiquido: parseMontoBHE(informe.totalLiquido),
-      },
-      boletas,
-    };
-  } finally {
-    if (pageRef) await logout(pageRef);
-    if (browser) await closeBrowserSafely(browser, "cierre navegador boletas honorarios");
-    cleanupSession(sessionId);
-    sessionSemaphore.release();
+    informe = await extractInformeMensualBHE(page);
+    boletasRaw.push(...informe.boletas);
   }
+
+  const boletas = boletasRaw.map((b) => ({
+    folio: b.folio,
+    estado: ESTADO_BHE_MAP[b.estado] ?? b.estado,
+    fechaAnulacion: b.fechaAnulacion || null,
+    fecha: b.fecha,
+    rutEmisor: b.rutEmisor,
+    nombreEmisor: b.nombreEmisor,
+    sociedadProfesional: b.sociedadProfesional,
+    montoBruto: parseMontoBHE(b.montoBruto),
+    montoRetenido: parseMontoBHE(b.montoRetenido),
+    montoLiquido: parseMontoBHE(b.montoLiquido),
+  }));
+
+  return {
+    caratula: {
+      rutContribuyente: informe.rut,
+      nombreContribuyente: informe.contribuyente,
+      mes: month,
+      anio: year,
+    },
+    resumen: {
+      totalBoletas: Number(informe.totalBoletas) || 0,
+      totalHonorarios: parseMontoBHE(informe.totalHonorarios),
+      totalRetencion: parseMontoBHE(informe.totalRetencion),
+      totalLiquido: parseMontoBHE(informe.totalLiquido),
+    },
+    boletas,
+  };
 }
 
 // ─── Validación ──────────────────────────────────────────────────────────────
@@ -1274,6 +1273,211 @@ app.post("/api/boletas/recibidas/:month/:year", requireApiKey, heavyLimiter, asy
     const status = message.includes("inválidas") ? 401 : 500;
     res.status(status).json({ error: message });
   }
+});
+
+// ─── Lotes asíncronos: una sesión SII para varias descargas ──────────────────
+
+type TipoLote = "f29_detalle" | "rcv_compras" | "rcv_ventas" | "bhe_recibidas";
+const TIPOS_LOTE: readonly TipoLote[] = ["f29_detalle", "rcv_compras", "rcv_ventas", "bhe_recibidas"];
+const LOTE_MAX_ITEMS = 50;
+const LOTE_ITEM_TIMEOUT_MS = 180_000;
+const LOTE_PAUSA_ENTRE_ITEMS_MS = 2_000;
+const LOTE_TTL_MS = 60 * 60_000;
+const LOTE_MAX_ALMACENADOS = 100;
+
+interface ItemLote {
+  tipo: TipoLote;
+  mes: number;
+  anio: number;
+  detallado?: boolean;
+}
+
+interface ResultadoLote {
+  item: ItemLote;
+  ok: boolean;
+  datos?: object;
+  error?: string;
+}
+
+interface Lote {
+  id: string;
+  rut: string;
+  estado: "en_cola" | "procesando" | "terminado" | "error";
+  total: number;
+  hechos: number;
+  resultados: ResultadoLote[];
+  error?: string;
+  terminadoEn?: number;
+}
+
+// Solo en memoria: un reinicio o despliegue pierde los lotes. La clave del SII nunca se
+// guarda en el lote: vive únicamente en la llamada a ejecutarLote mientras corre.
+const lotes = new Map<string, Lote>();
+const lotesActivosPorRut = new Set<string>();
+
+function purgarLotesVencidos(): void {
+  const ahora = Date.now();
+  for (const [id, lote] of lotes) {
+    if (lote.terminadoEn !== undefined && ahora - lote.terminadoEn > LOTE_TTL_MS) lotes.delete(id);
+  }
+}
+setInterval(purgarLotesVencidos, 5 * 60_000).unref();
+
+function validarItemsLote(raw: unknown): { items: ItemLote[] } | { error: string } {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { error: "'items' debe ser un arreglo con al menos un ítem." };
+  }
+  if (raw.length > LOTE_MAX_ITEMS) {
+    return { error: `Un lote admite como máximo ${LOTE_MAX_ITEMS} ítems.` };
+  }
+  const items: ItemLote[] = [];
+  for (const [i, entrada] of raw.entries()) {
+    const it = (entrada ?? {}) as Record<string, unknown>;
+    if (!TIPOS_LOTE.includes(it.tipo as TipoLote)) {
+      return { error: `Ítem ${i}: 'tipo' debe ser uno de: ${TIPOS_LOTE.join(", ")}.` };
+    }
+    const mes = Number(it.mes);
+    const anio = Number(it.anio);
+    if (!Number.isInteger(mes) || !MONTH_REGEX.test(String(mes))) {
+      return { error: `Ítem ${i}: 'mes' inválido. Use un valor entre 1 y 12.` };
+    }
+    if (!Number.isInteger(anio) || !YEAR_REGEX.test(String(anio))) {
+      return { error: `Ítem ${i}: 'anio' inválido. Use un año de 4 dígitos.` };
+    }
+    const item: ItemLote = { tipo: it.tipo as TipoLote, mes, anio };
+    if (it.tipo === "rcv_compras" || it.tipo === "rcv_ventas") item.detallado = it.detallado === true;
+    items.push(item);
+  }
+  return { items };
+}
+
+function descargarItemLote(page: Page, rut: string, item: ItemLote): Promise<object> {
+  const mes = String(item.mes);
+  const anio = String(item.anio);
+  switch (item.tipo) {
+    case "f29_detalle":
+      return descargarF29Detalle(page, rut, mes, anio);
+    case "rcv_compras":
+      return descargarRCV(page, mes, anio, rut, "compras", item.detallado === true);
+    case "rcv_ventas":
+      return descargarRCV(page, mes, anio, rut, "ventas", item.detallado === true);
+    case "bhe_recibidas":
+      return descargarBHE(page, mes, anio);
+  }
+}
+
+// Tras un timeout la página puede quedar a medio navegar: seguir usándola daría
+// resultados de otra consulta, así que el lote se detiene.
+function esTimeout(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : "";
+  return (
+    (err instanceof Error && err.name === "TimeoutError") ||
+    /^Tiempo máximo excedido|^Timeout esperando|^Waiting failed|^Navigation timeout/.test(message)
+  );
+}
+
+async function ejecutarLote(lote: Lote, pass: string, items: ItemLote[]): Promise<void> {
+  const noEjecutados = (desde: number, motivo: string) => {
+    for (const item of items.slice(desde)) lote.resultados.push({ item, ok: false, error: motivo });
+  };
+  try {
+    await conSesionSii("lote", lote.rut, pass, async (page) => {
+      lote.estado = "procesando";
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        try {
+          const datos = await withTimeout(
+            descargarItemLote(page, lote.rut, item),
+            LOTE_ITEM_TIMEOUT_MS,
+            `ítem ${i + 1} (${item.tipo})`
+          );
+          lote.resultados.push({ item, ok: true, datos });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Error desconocido";
+          console.error(`[lote ${lote.id}] ítem ${i + 1} (${item.tipo}) falló: ${message}`);
+          lote.resultados.push({ item, ok: false, error: message });
+          if (esTimeout(err)) {
+            lote.error = "Lote detenido por un timeout: la sesión quedó en un estado incierto.";
+            lote.hechos = i + 1;
+            noEjecutados(i + 1, "No ejecutado: el lote se detuvo por un timeout previo.");
+            return;
+          }
+        }
+        lote.hechos = i + 1;
+        if (i < items.length - 1) await new Promise((r) => setTimeout(r, LOTE_PAUSA_ENTRE_ITEMS_MS));
+      }
+    });
+    lote.estado = lote.error ? "error" : "terminado";
+  } catch (err) {
+    // Login fallido o Chromium sin arrancar: ningún ítem llegó a ejecutarse.
+    lote.error = err instanceof Error ? err.message : "Error desconocido";
+    lote.estado = "error";
+    noEjecutados(lote.resultados.length, "No ejecutado: no se pudo abrir la sesión en el SII.");
+    console.error(`[lote ${lote.id}] error de sesión: ${lote.error}`);
+  } finally {
+    lote.terminadoEn = Date.now();
+    lotesActivosPorRut.delete(lote.rut);
+    console.log(`[lote ${lote.id}] ${lote.estado}: ${lote.hechos}/${lote.total} ítems`);
+  }
+}
+
+const lotePollLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiadas consultas de lote. Espere un momento antes de intentarlo de nuevo." },
+});
+
+app.post("/api/v1/lotes", requireApiKey, heavyLimiter, (req: Request, res: Response) => {
+  const creds = getRcvCredentialsFromBody(req.body, res);
+  if (!creds) return;
+  const validacion = validarItemsLote((req.body as { items?: unknown }).items);
+  if ("error" in validacion) {
+    res.status(400).json({ error: validacion.error });
+    return;
+  }
+  if (!checkRutCooldown(creds.user, res)) return;
+  purgarLotesVencidos();
+  if (lotes.size >= LOTE_MAX_ALMACENADOS) {
+    res.status(503).json({ error: "Demasiados lotes almacenados. Reintente en unos minutos." });
+    return;
+  }
+
+  const lote: Lote = {
+    id: randomUUID(),
+    rut: creds.user,
+    estado: "en_cola",
+    total: validacion.items.length,
+    hechos: 0,
+    resultados: [],
+  };
+  lotes.set(lote.id, lote);
+  lotesActivosPorRut.add(lote.rut);
+  void ejecutarLote(lote, creds.pass, validacion.items);
+
+  res.status(202).json({
+    id: lote.id,
+    estado: lote.estado,
+    total: lote.total,
+    consultar: `/api/v1/lotes/${lote.id}`,
+  });
+});
+
+app.get("/api/v1/lotes/:id", requireApiKey, lotePollLimiter, (req: Request, res: Response) => {
+  const lote = lotes.get(req.params.id);
+  if (!lote) {
+    res.status(404).json({ error: "Lote no encontrado o vencido." });
+    return;
+  }
+  res.json({
+    id: lote.id,
+    estado: lote.estado,
+    total: lote.total,
+    hechos: lote.hechos,
+    resultados: lote.resultados,
+    ...(lote.error ? { error: lote.error } : {}),
+  });
 });
 
 app.get("/health", (_req: Request, res: Response) => {
