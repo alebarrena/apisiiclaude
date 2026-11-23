@@ -11,7 +11,12 @@
     },
     {
       "key": "api_key",
-      "value": "57e5abfc9a91c1e6f0aa381c801604a9dee9983d58e1ff6db8dafacf614a96b4",
+      "value": "REEMPLAZAR_API_KEY",
+      "type": "string"
+    },
+    {
+      "key": "lote_id",
+      "value": "",
       "type": "string"
     }
   ],
@@ -30,15 +35,228 @@
         "method": "POST",
         "url": "{{base_url}}/getEstadoF29",
         "header": [
-          { "key": "Content-Type", "value": "application/json" },
-          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"rut\": \"REEMPLAZAR_RUT\",\n  \"pass\": \"REEMPLAZAR_PASS\"\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "description": "Obtiene el estado del Formulario 29 (IVA). Las credenciales van en el body."
+      }
+    },
+    {
+      "name": "Declaración F29 — Por Mes",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"rut\": \"REEMPLAZAR_RUT\",\n  \"pass\": \"REEMPLAZAR_CLAVE_SII\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/api/F29/declaracion/09/2026",
+        "description": "Estado de la declaración F29 de un período: si está declarada (estado, monto, folio, fecha) y la base de ventas netas para PPM. Un login por consulta."
+      }
+    },
+    {
+      "name": "Detalle F29 por código — Por Mes",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"rut\": \"REEMPLAZAR_RUT\",\n  \"pass\": \"REEMPLAZAR_CLAVE_SII\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/api/F29/detalle/09/2026",
+        "description": "Todos los códigos de la declaración F29 vigente del período (montos enteros), folio, fecha e historial. 404 si el período no tiene declaración vigente. Nunca rectifica."
+      }
+    },
+    {
+      "name": "Detalle F22 por código — Año tributario",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"rut\": \"REEMPLAZAR_RUT\",\n  \"pass\": \"REEMPLAZAR_CLAVE_SII\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/api/F22/detalle/2026",
+        "description": "Todos los códigos del F22 vigente del año tributario (montos enteros en codigos; campos de texto en codigosTexto) y su folio. 404 si no hay F22 vigente. Nunca rectifica."
+      }
+    },
+    {
+      "name": "Estado F22 — Año tributario",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"rut\": \"REEMPLAZAR_RUT\",\n  \"pass\": \"REEMPLAZAR_CLAVE_SII\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/api/F22/estado/2026",
+        "description": "Estado del F22 de un año tributario: folio vigente, historial de eventos del SII y lista de observaciones vigentes (vacía si no hay). 404 si no hay F22 vigente."
+      }
+    },
+    {
+      "name": "Estado declaraciones juradas — Año tributario",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"rut\": \"REEMPLAZAR_RUT\",\n  \"pass\": \"REEMPLAZAR_CLAVE_SII\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/api/DDJJ/estado/2026",
+        "description": "Declaraciones juradas anuales presentadas en el año tributario: formulario, folio, fecha, estado (Aceptada, etc.), tipo y medio de presentación."
+      }
+    },
+    {
+      "name": "Boletas honorarios recibidas — Informe anual",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"rut\": \"REEMPLAZAR_RUT\",\n  \"pass\": \"REEMPLAZAR_CLAVE_SII\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/api/boletas/recibidas-anual/2026",
+        "description": "Resumen de los 12 meses de boletas de honorarios electrónicas recibidas en una sola consulta (vigentes, anuladas, honorario bruto, retenciones y líquido) más los totales del año."
+      }
+    },
+    {
+      "name": "Lote — Crear",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"rut\": \"REEMPLAZAR_RUT\",\n  \"pass\": \"REEMPLAZAR_CLAVE_SII\",\n  \"items\": [\n    { \"tipo\": \"f29_detalle\", \"mes\": 9, \"anio\": 2026 },\n    { \"tipo\": \"rcv_ventas\", \"mes\": 9, \"anio\": 2026, \"detallado\": true },\n    { \"tipo\": \"rcv_compras\", \"mes\": 9, \"anio\": 2026, \"detallado\": false },\n    { \"tipo\": \"bhe_recibidas\", \"mes\": 9, \"anio\": 2026 },\n    { \"tipo\": \"f22_detalle\", \"anio\": 2026 },\n    { \"tipo\": \"f22_estado\", \"anio\": 2026 },\n    { \"tipo\": \"ddjj_estado\", \"anio\": 2026 },\n    { \"tipo\": \"bhe_anual\", \"anio\": 2026 }\n  ]\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/api/v1/lotes",
+        "description": "Inicia un lote asíncrono: UNA sesión SII para varias descargas (máx. 50). Tipos mensuales (mes y anio): f29_detalle, rcv_compras, rcv_ventas, bhe_recibidas. Tipos anuales (solo anio = año tributario o año del informe): f22_detalle, f22_estado, ddjj_estado, bhe_anual. Responde 202 con el id; consulte el avance con \"Lote — Consultar\". Mientras corre, cualquier otra consulta del mismo RUT recibe 409."
+      }
+    },
+    {
+      "name": "Lote — Consultar",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
+        ],
+        "url": "{{base_url}}/api/v1/lotes/{{lote_id}}",
+        "description": "Estado y resultados de un lote: en_cola, procesando, terminado o error. Los resultados se conservan 1 hora en memoria. Pegue el id de \"Lote — Crear\" en la variable lote_id."
       }
     },
     {
@@ -47,13 +265,23 @@
         "method": "POST",
         "url": "{{base_url}}/api/RCV/compras/04/2025",
         "header": [
-          { "key": "Content-Type", "value": "application/json" },
-          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "description": "Obtiene compras del mes. Credenciales tomadas de SII_RUT / SII_PASS en .env. Parámetros en la URL: /compras/{mes}/{año}"
       }
@@ -64,13 +292,23 @@
         "method": "POST",
         "url": "{{base_url}}/api/RCV/ventas/04/2025",
         "header": [
-          { "key": "Content-Type", "value": "application/json" },
-          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "description": "Obtiene ventas del mes. Parámetros en la URL: /ventas/{mes}/{año}"
       }
@@ -81,13 +319,23 @@
         "method": "POST",
         "url": "{{base_url}}/api/boletas/recibidas/04/2025",
         "header": [
-          { "key": "Content-Type", "value": "application/json" },
-          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"rut\": \"REEMPLAZAR_RUT\",\n  \"pass\": \"REEMPLAZAR_PASS\"\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "description": "Informe mensual de boletas de honorarios RECIBIDAS por el RUT indicado. Parámetros en la URL: /recibidas/{mes}/{año}. Credenciales van en el body."
       }
@@ -106,13 +354,23 @@
         "method": "POST",
         "url": "{{base_url}}/getEstadoF29",
         "header": [
-          { "key": "Content-Type", "value": "application/json" },
-          { "key": "X-Api-Key",    "value": "clave_incorrecta" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "clave_incorrecta"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{\n  \"rut\": \"12345678-9\",\n  \"pass\": \"test\"\n}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "description": "Debe retornar 401."
       }
@@ -123,13 +381,23 @@
         "method": "POST",
         "url": "{{base_url}}/api/RCV/compras/13/2025",
         "header": [
-          { "key": "Content-Type", "value": "application/json" },
-          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "description": "Mes 13 es inválido. Debe retornar 400."
       }
@@ -140,13 +408,23 @@
         "method": "POST",
         "url": "{{base_url}}/api/RCV/compras/04/25",
         "header": [
-          { "key": "Content-Type", "value": "application/json" },
-          { "key": "X-Api-Key",    "value": "{{api_key}}" }
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{api_key}}"
+          }
         ],
         "body": {
           "mode": "raw",
           "raw": "{}",
-          "options": { "raw": { "language": "json" } }
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
         },
         "description": "Año '25' es inválido (debe tener 4 dígitos). Debe retornar 400."
       }

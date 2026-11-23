@@ -782,6 +782,62 @@ async function descargarBHE(page: Page, month: string, year: string): Promise<ob
   };
 }
 
+// Informe anual de BHE recibidas: una sola consulta con el resumen de los 12 meses. Los datos
+// vienen en window.xml_values con un sufijo por columna: 1 = honorario bruto, 2 = retención de
+// terceros, 3 = retención del contribuyente, 6 = boletas vigentes, 7 = boletas anuladas y
+// sum<mes> = total líquido. (1, 2, 6 y sum están contrastados con un mes con datos; 3 y 7 se
+// leen por posición en la tabla pero estaban vacíos en la cuenta de prueba.)
+const MESES_BHE = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+async function descargarBHEAnual(page: Page, year: string): Promise<object> {
+  await page.goto(
+    `https://loa.sii.cl/cgi_IMT/TMBCOC_MenuConsultasContribRec.cgi?dummy=${Date.now()}`,
+    { waitUntil: "domcontentloaded", timeout: PAGE_TIMEOUT_MS }
+  );
+  await page.waitForSelector("select[name='cbanoinformeanual']", { timeout: PAGE_TIMEOUT_MS });
+  await page.select("select[name='cbanoinformeanual']", year);
+  await Promise.all([
+    page.waitForNavigation({ timeout: PAGE_TIMEOUT_MS }),
+    page.click('input[name="cmdconsultar12"]'),
+  ]);
+  await page.waitForFunction(() => typeof (window as any).xml_values !== "undefined", {
+    timeout: PAGE_TIMEOUT_MS,
+  });
+  const xv = await page.evaluate(() => {
+    const src = (window as any).xml_values as Record<string, unknown>;
+    const out: Record<string, string> = {};
+    for (const k of Object.keys(src)) out[k] = String(src[k] ?? "");
+    return out;
+  });
+
+  const meses = MESES_BHE.map((m, i) => ({
+    mes: i + 1,
+    boletasVigentes: Number(xv[`${m}6`]) || 0,
+    boletasAnuladas: Number(xv[`${m}7`]) || 0,
+    honorarioBruto: parseMontoBHE(xv[`${m}1`]),
+    retencionTerceros: parseMontoBHE(xv[`${m}2`]),
+    retencionContribuyente: parseMontoBHE(xv[`${m}3`]),
+    totalLiquido: parseMontoBHE(xv[`sum${m}`]),
+  }));
+  return {
+    anio: Number(xv["anio_consulta"]) || Number(year),
+    contribuyente: { rut: `${xv["rut_arrastre"]}-${xv["dv_arrastre"]}`, nombre: xv["nombre_contribuyente"] },
+    meses,
+    totales: {
+      boletasVigentes: Number(xv["tot6"]) || 0,
+      boletasAnuladas: Number(xv["tot7"]) || 0,
+      honorarioBruto: parseMontoBHE(xv["tot1"]),
+      retencionTerceros: parseMontoBHE(xv["tot2"]),
+      retencionContribuyente: parseMontoBHE(xv["tot3"]),
+      totalLiquido: parseMontoBHE(xv["sumtot"]),
+    },
+    origen: {
+      servicio: "https://loa.sii.cl/cgi_IMT/TMBCOC_InformeAnualBheRec.cgi (informe anual BHE recibidas)",
+      descargado: new Date().toISOString(),
+    },
+  };
+}
+
 // ─── Validación ──────────────────────────────────────────────────────────────
 
 const RUT_REGEX   = /^\d{1,8}-[\dkK]$/;
@@ -872,27 +928,30 @@ const F29_NS = "cl.sii.sdi.lob.iva.propuestaf29.data.api.interfaces";
 interface F29Envelope<T> {
   data: T;
   metaData?: { errors?: unknown };
+  respCod?: number | null;
+  errorMsg?: string | null;
 }
 
-// Llama a un servicio JSON de la app desde el contexto de la página (cookies de sesión).
-// Las rutas usan la inicial en minúscula (facadeAdapterService) y el namespace en mayúscula.
-async function callF29Service<T>(
+// Llama a un servicio JSON (envelope {metaData, data}) de una app del SII desde el contexto
+// de la página, con las cookies de sesión. La página debe estar ya en el origen de la app.
+async function llamarServicioSii<T>(
   page: Page,
-  service: string,
+  url: string,
+  namespace: string,
   method: string,
   data: Record<string, unknown>
 ): Promise<T> {
   const run = () => page.evaluate(
-    async (ns, svc, mth, payload) => {
+    async (u, ns, payload) => {
       const body = {
         metaData: {
-          namespace: `${ns}.${svc}/${mth}`,
+          namespace: ns,
           conversationId: `X${Math.random().toString(36).slice(2, 12).toUpperCase()}`,
           transactionId: crypto.randomUUID(),
         },
         data: payload,
       };
-      const r = await fetch(`/propuestaf29ui/services/data/${svc.charAt(0).toLowerCase()}${svc.slice(1)}/${mth}`, {
+      const r = await fetch(u, {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify(body),
@@ -900,9 +959,8 @@ async function callF29Service<T>(
       });
       return { status: r.status, text: await r.text() };
     },
-    F29_NS,
-    service,
-    method,
+    url,
+    namespace,
     data
   );
   let result: { status: number; text: string };
@@ -921,10 +979,27 @@ async function callF29Service<T>(
   } catch {
     throw new Error(`Respuesta no válida del SII en ${method}`);
   }
-  if (parsed.metaData?.errors) {
-    throw new Error(`El SII devolvió un error en ${method}`);
+  if (parsed.metaData?.errors || parsed.respCod === -1) {
+    throw new Error(`El SII devolvió un error en ${method}${parsed.errorMsg ? `: ${parsed.errorMsg}` : ""}`);
   }
   return parsed.data;
+}
+
+// App propuestaf29ui: las rutas usan la inicial en minúscula (facadeAdapterService) y el
+// namespace en mayúscula.
+function callF29Service<T>(
+  page: Page,
+  service: string,
+  method: string,
+  data: Record<string, unknown>
+): Promise<T> {
+  return llamarServicioSii<T>(
+    page,
+    `/propuestaf29ui/services/data/${service.charAt(0).toLowerCase()}${service.slice(1)}/${method}`,
+    `${F29_NS}.${service}/${method}`,
+    method,
+    data
+  );
 }
 
 interface F29DeclaracionRaw {
@@ -995,7 +1070,7 @@ const F29_CONSULTA_URL = "https://www4.sii.cl/rfiInternet/consulta/index.html";
 const MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto",
   "Septiembre", "Octubre", "Noviembre", "Diciembre"];
 
-class F29SinVigenteError extends Error {}
+class SinDeclaracionError extends Error {}
 
 // "1.753.554" → 1753554 ; "0,25" → 0.25
 function parseMontoSii(v: string): number | null {
@@ -1029,7 +1104,7 @@ async function descargarF29Detalle(page: Page, rut: string, month: string, year:
   );
   const lista = Array.isArray(declaraciones) ? declaraciones : [];
   if (!lista.some((d) => /vigente/i.test(d.estado))) {
-    throw new F29SinVigenteError(`No hay declaración F29 vigente para el período ${year}-${mes.padStart(2, "0")}.`);
+    throw new SinDeclaracionError(`No hay declaración F29 vigente para el período ${year}-${mes.padStart(2, "0")}.`);
   }
 
   // Portal de consulta: seleccionar formulario y período, y buscar.
@@ -1080,7 +1155,7 @@ async function descargarF29Detalle(page: Page, rut: string, month: string, year:
     Array.from(document.querySelectorAll("a")).find((a) => /^\d{8,}$/.test(a.textContent?.trim() ?? "")) ?? null
   );
   const link = linkHandle.asElement();
-  if (!link) throw new F29SinVigenteError("El portal SII no listó declaraciones vigentes para el período.");
+  if (!link) throw new SinDeclaracionError("El portal SII no listó declaraciones vigentes para el período.");
   const folio = Number((await link.evaluate((a) => a.textContent ?? "")).trim());
   await (link as unknown as { click(): Promise<void> }).click();
 
@@ -1162,10 +1237,264 @@ app.post("/api/F29/detalle/:month/:year", requireApiKey, heavyLimiter, async (re
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
     console.error("[/api/F29/detalle] Error:", message);
-    const status = err instanceof F29SinVigenteError ? 404 : message.includes("inválidas") ? 401 : 500;
+    const status = err instanceof SinDeclaracionError ? 404 : message.includes("inválidas") ? 401 : 500;
     res.status(status).json({ error: message });
   }
 });
+
+// ─── F22 (consultaestadof22ui) y estado de DDJJ (djconsulta) ─────────────────
+
+const F22_APP_URL = "https://www4.sii.cl/consultaestadof22ui/";
+const F22_NS = "cl.sii.sdi.lob.renta.consultaestadof22.data.api.interfaces.FacadeService";
+const DDJJ_CONSULTA_URL = "https://www2.sii.cl/djconsulta/consultaddjjs";
+
+function callF22Service<T>(page: Page, method: string, data: Record<string, unknown>): Promise<T> {
+  return llamarServicioSii<T>(
+    page,
+    `/consultaestadof22ui/services/data/facadeService/${method}`,
+    `${F22_NS}/${method}`,
+    method,
+    data
+  );
+}
+
+interface F22FolioRaw {
+  folio: number;
+  fecIng: string;
+  vgte: string | null;
+  evigCodigo: string;
+  rectificacble: string | null;
+}
+
+interface F22EventoRaw {
+  codEvento: string;
+  nombre: string;
+  fechaEvento: string;
+}
+
+const pausa = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Abre la app del F22 y localiza el folio vigente del año tributario `at`.
+async function abrirConsultaF22(
+  page: Page,
+  rut: string,
+  at: string
+): Promise<{ vigente: F22FolioRaw; folios: F22FolioRaw[] }> {
+  await page.goto(F22_APP_URL, { waitUntil: "load", timeout: PAGE_TIMEOUT_MS });
+  await page.waitForNetworkIdle({ idleTime: 2_000, timeout: 20_000 }).catch(() => {});
+  const [num, dv] = rut.split("-");
+  const folios = await callF22Service<F22FolioRaw[] | null>(page, "consultaFolios", {
+    rut: num,
+    dv,
+    periodo: Number(at),
+    pathRuta: "/consultaEstadoDecIni",
+  });
+  const lista = Array.isArray(folios) ? folios : [];
+  const vigente = lista.find((f) => f.vgte === "1");
+  if (!vigente) throw new SinDeclaracionError(`No hay F22 vigente para el año tributario ${at}.`);
+  return { vigente, folios: lista };
+}
+
+// Estado del F22 de un año tributario: folio vigente, historial de eventos y observaciones.
+async function descargarF22Estado(page: Page, rut: string, at: string): Promise<object> {
+  const { vigente, folios } = await abrirConsultaF22(page, rut, at);
+  const [num, dv] = rut.split("-");
+  const observaciones = await callF22Service<unknown[] | null>(page, "situacionObservacion", {
+    periodo: Number(at), rut: num, dv, folio: vigente.folio,
+  });
+  const eventos = await callF22Service<F22EventoRaw[] | null>(page, "buscaEventos", {
+    periodo: Number(at), rut: num, dv, folio: vigente.folio, impugnado: "0", evigCodigo: vigente.evigCodigo,
+  });
+  const historial = (Array.isArray(eventos) ? eventos : []).map((e) => ({
+    fecha: fechaSiiAIso(e.fechaEvento),
+    codigo: e.codEvento,
+    descripcion: e.nombre,
+  }));
+  return {
+    at: Number(at),
+    vigente: {
+      folio: vigente.folio,
+      fechaIngreso: fechaSiiAIso(vigente.fecIng),
+      rectificable: vigente.rectificacble === "1",
+      estadoCodigo: vigente.evigCodigo,
+    },
+    ultimoEvento: historial.length > 0 ? historial[historial.length - 1] : null,
+    historial,
+    // Observaciones vigentes tal como las entrega el SII (vacío si no hay ninguna).
+    observaciones: Array.isArray(observaciones) ? observaciones : [],
+    otrosFolios: folios
+      .filter((f) => f !== vigente)
+      .map((f) => ({ folio: f.folio, fechaIngreso: fechaSiiAIso(f.fecIng) })),
+    origen: { servicio: `${F22_APP_URL} (consultaFolios, situacionObservacion, buscaEventos)`, descargado: new Date().toISOString() },
+  };
+}
+
+// Detalle por código del F22 vigente. La app muestra el formulario completo en HTML y cada
+// campo es un <input id="COD_xxx">: se leen por id. Nunca se pulsa "Rectificar".
+async function descargarF22Detalle(page: Page, rut: string, at: string): Promise<object> {
+  const { vigente } = await abrirConsultaF22(page, rut, at);
+
+  const sel = await page.$("select");
+  if (!sel) throw new Error("No se encontró el selector de año tributario del portal SII.");
+  const valor = await sel.evaluate(
+    (s, t) => Array.from(s.options).find((o) => o.text.trim() === t)?.value ?? null,
+    at
+  );
+  if (valor === null) throw new SinDeclaracionError(`El portal SII no ofrece el año tributario ${at}.`);
+  await sel.select(valor);
+  await pausa(1_500);
+  await page.evaluate(() => {
+    const b = Array.from(document.querySelectorAll("button")).find((x) => (x.textContent ?? "").trim() === "Consultar");
+    if (!b) throw new Error("No se encontró el botón Consultar del portal SII.");
+    b.click();
+  });
+  await page.waitForFunction(
+    () => Array.from(document.querySelectorAll("a,button")).some((e) => (e.textContent ?? "").trim() === "Formulario 22"),
+    { timeout: PAGE_TIMEOUT_MS }
+  );
+  await page.evaluate(() => {
+    const e = Array.from(document.querySelectorAll("a,button")).find((x) => (x.textContent ?? "").trim() === "Formulario 22");
+    (e as HTMLElement).click();
+  });
+  // El formulario se rellena de forma asíncrona: esperar a que el folio esté cargado.
+  await page.waitForFunction(
+    () => ((document.querySelector("#FOLIO_PRM") as HTMLInputElement | null)?.value ?? "").trim() !== "",
+    { timeout: PAGE_TIMEOUT_MS }
+  );
+  await pausa(1_000);
+
+  // El código sale de ng-model="formulario.declaracion.cod###" (el id unas veces es COD_### y
+  // otras solo el número). Se ignoran los checkboxes y los campos sin valor.
+  const crudos = await page.evaluate(() => {
+    const out: [string, string][] = [];
+    for (const i of Array.from(document.querySelectorAll("input")) as HTMLInputElement[]) {
+      const v = i.value.trim();
+      if (v === "" || v === "on" || v === "off") continue;
+      const m = /\.cod(\d+)$/.exec(i.getAttribute("ng-model") ?? "") ?? /^(?:COD_)?(\d{1,5})$/.exec(i.id);
+      if (m) out.push([m[1], v]);
+    }
+    return out;
+  });
+  const codigos: Record<string, number> = {};
+  const codigosTexto: Record<string, string> = {};
+  for (const [codigo, valorCrudo] of crudos) {
+    const n = /^-?[\d.]+(,\d+)?$/.test(valorCrudo) ? parseMontoSii(valorCrudo) : null;
+    if (n !== null) codigos[codigo] = n;
+    else codigosTexto[codigo] = valorCrudo;
+  }
+  return {
+    at: Number(at),
+    vigente: { folio: vigente.folio, fecha: fechaSiiAIso(vigente.fecIng) },
+    codigos,
+    codigosTexto,
+    origen: { servicio: `${F22_APP_URL}#!/f22Completo (Formulario 22)`, descargado: new Date().toISOString() },
+  };
+}
+
+interface DjDetalleRaw {
+  titulo: string;
+  dj: number;
+  result: {
+    codEstado: number;
+    estado: string;
+    fecha: string | null;
+    mes: number | null;
+    folio: number;
+    medioPresentacion: string | null;
+    tipoDeclaracion: string | null;
+    casos: number | null;
+  }[];
+}
+
+// El SII entrega entidades HTML ("Formulario Electr&oacute;nico") en algunos textos.
+function decodificarEntidades(s: string): string {
+  const mapa: Record<string, string> = {
+    aacute: "á", eacute: "é", iacute: "í", oacute: "ó", uacute: "ú", ntilde: "ñ",
+    Aacute: "Á", Eacute: "É", Iacute: "Í", Oacute: "Ó", Uacute: "Ú", Ntilde: "Ñ", amp: "&",
+  };
+  return s.replace(/&(#\d+|\w+);/g, (m, e: string) =>
+    e.startsWith("#") ? String.fromCharCode(Number(e.slice(1))) : mapa[e] ?? m
+  );
+}
+
+// Declaraciones juradas anuales presentadas en un año tributario. Se llama directo al servicio
+// JSON de la app (mismas cookies de sesión) en vez de depender de la tabla de años de la pantalla,
+// que solo muestra los últimos tres y no siempre se dibuja a tiempo.
+async function descargarDDJJEstado(page: Page, rut: string, at: string): Promise<object> {
+  await page.goto(DDJJ_CONSULTA_URL, { waitUntil: "load", timeout: PAGE_TIMEOUT_MS });
+  await page.waitForNetworkIdle({ idleTime: 2_000, timeout: 20_000 }).catch(() => {});
+  const resultado = await page.evaluate(async (rutUrl: string, periodo: string) => {
+    const r = await fetch(`/app/djconsulta/${rutUrl}/recurso/v1/dj/getDjIntegralAnualDetalle`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ periodo }),
+      credentials: "include",
+    });
+    return { status: r.status, text: await r.text() };
+  }, rut, at);
+  if (resultado.status !== 200) {
+    throw new Error(`El SII respondió ${resultado.status} al consultar las declaraciones juradas del año ${at}.`);
+  }
+  let json: { data?: DjDetalleRaw[] };
+  try {
+    json = JSON.parse(resultado.text) as { data?: DjDetalleRaw[] };
+  } catch {
+    throw new Error("Respuesta no válida del SII al consultar las declaraciones juradas.");
+  }
+  const declaraciones = (json.data ?? []).flatMap((dj) =>
+    (dj.result ?? []).map((r) => ({
+      formulario: dj.dj,
+      titulo: decodificarEntidades(dj.titulo.trim()),
+      folio: r.folio,
+      fecha: r.fecha ? r.fecha.slice(0, 10) : null,
+      estado: r.estado,
+      codigoEstado: r.codEstado,
+      tipo: r.tipoDeclaracion,
+      medioPresentacion: r.medioPresentacion ? decodificarEntidades(r.medioPresentacion) : null,
+      casos: r.casos,
+    }))
+  );
+  return {
+    at: Number(at),
+    declaraciones,
+    origen: { servicio: "https://www2.sii.cl/djconsulta/estadoddjjs (getDjIntegralAnualDetalle)", descargado: new Date().toISOString() },
+  };
+}
+
+function rutaPorAnioTributario(
+  ruta: string,
+  etiqueta: string,
+  fn: (page: Page, rut: string, at: string) => Promise<object>
+): void {
+  app.post(ruta, requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
+    const { at } = req.params;
+    if (!YEAR_REGEX.test(at)) {
+      res.status(400).json({ error: "Año inválido. Use un año de 4 dígitos." });
+      return;
+    }
+    const creds = getRcvCredentialsFromBody(req.body, res);
+    if (!creds) return;
+    if (!checkRutCooldown(creds.user, res)) return;
+    try {
+      const data = await withTimeout(
+        conSesionSii(etiqueta, creds.user, creds.pass, (page) => fn(page, creds.user, at)),
+        REQUEST_TIMEOUT_MS,
+        `consulta ${etiqueta}`
+      );
+      res.json(data);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Error desconocido";
+      console.error(`[${ruta}] Error:`, message);
+      const status = err instanceof SinDeclaracionError ? 404 : message.includes("inválidas") ? 401 : 500;
+      res.status(status).json({ error: message });
+    }
+  });
+}
+
+rutaPorAnioTributario("/api/F22/detalle/:at", "detalle F22", descargarF22Detalle);
+rutaPorAnioTributario("/api/F22/estado/:at", "estado F22", descargarF22Estado);
+rutaPorAnioTributario("/api/DDJJ/estado/:at", "estado DDJJ", descargarDDJJEstado);
+rutaPorAnioTributario("/api/boletas/recibidas-anual/:at", "informe anual BHE", (page, _rut, anio) => descargarBHEAnual(page, anio));
 
 app.post("/api/F29/declaracion/:month/:year", requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
   const { month, year } = req.params;
@@ -1277,8 +1606,15 @@ app.post("/api/boletas/recibidas/:month/:year", requireApiKey, heavyLimiter, asy
 
 // ─── Lotes asíncronos: una sesión SII para varias descargas ──────────────────
 
-type TipoLote = "f29_detalle" | "rcv_compras" | "rcv_ventas" | "bhe_recibidas";
-const TIPOS_LOTE: readonly TipoLote[] = ["f29_detalle", "rcv_compras", "rcv_ventas", "bhe_recibidas"];
+type TipoLote =
+  | "f29_detalle" | "rcv_compras" | "rcv_ventas" | "bhe_recibidas"
+  | "f22_detalle" | "f22_estado" | "ddjj_estado" | "bhe_anual";
+const TIPOS_LOTE: readonly TipoLote[] = [
+  "f29_detalle", "rcv_compras", "rcv_ventas", "bhe_recibidas",
+  "f22_detalle", "f22_estado", "ddjj_estado", "bhe_anual",
+];
+// Tipos anuales: `anio` es el año tributario y no llevan mes.
+const TIPOS_LOTE_ANUALES: readonly TipoLote[] = ["f22_detalle", "f22_estado", "ddjj_estado", "bhe_anual"];
 const LOTE_MAX_ITEMS = 50;
 const LOTE_ITEM_TIMEOUT_MS = 180_000;
 const LOTE_PAUSA_ENTRE_ITEMS_MS = 2_000;
@@ -1287,7 +1623,7 @@ const LOTE_MAX_ALMACENADOS = 100;
 
 interface ItemLote {
   tipo: TipoLote;
-  mes: number;
+  mes?: number;
   anio: number;
   detallado?: boolean;
 }
@@ -1336,15 +1672,16 @@ function validarItemsLote(raw: unknown): { items: ItemLote[] } | { error: string
     if (!TIPOS_LOTE.includes(it.tipo as TipoLote)) {
       return { error: `Ítem ${i}: 'tipo' debe ser uno de: ${TIPOS_LOTE.join(", ")}.` };
     }
+    const anual = TIPOS_LOTE_ANUALES.includes(it.tipo as TipoLote);
     const mes = Number(it.mes);
     const anio = Number(it.anio);
-    if (!Number.isInteger(mes) || !MONTH_REGEX.test(String(mes))) {
+    if (!anual && (!Number.isInteger(mes) || !MONTH_REGEX.test(String(mes)))) {
       return { error: `Ítem ${i}: 'mes' inválido. Use un valor entre 1 y 12.` };
     }
     if (!Number.isInteger(anio) || !YEAR_REGEX.test(String(anio))) {
       return { error: `Ítem ${i}: 'anio' inválido. Use un año de 4 dígitos.` };
     }
-    const item: ItemLote = { tipo: it.tipo as TipoLote, mes, anio };
+    const item: ItemLote = anual ? { tipo: it.tipo as TipoLote, anio } : { tipo: it.tipo as TipoLote, mes, anio };
     if (it.tipo === "rcv_compras" || it.tipo === "rcv_ventas") item.detallado = it.detallado === true;
     items.push(item);
   }
@@ -1352,7 +1689,7 @@ function validarItemsLote(raw: unknown): { items: ItemLote[] } | { error: string
 }
 
 function descargarItemLote(page: Page, rut: string, item: ItemLote): Promise<object> {
-  const mes = String(item.mes);
+  const mes = String(item.mes ?? "");
   const anio = String(item.anio);
   switch (item.tipo) {
     case "f29_detalle":
@@ -1363,6 +1700,14 @@ function descargarItemLote(page: Page, rut: string, item: ItemLote): Promise<obj
       return descargarRCV(page, mes, anio, rut, "ventas", item.detallado === true);
     case "bhe_recibidas":
       return descargarBHE(page, mes, anio);
+    case "f22_detalle":
+      return descargarF22Detalle(page, rut, anio);
+    case "f22_estado":
+      return descargarF22Estado(page, rut, anio);
+    case "ddjj_estado":
+      return descargarDDJJEstado(page, rut, anio);
+    case "bhe_anual":
+      return descargarBHEAnual(page, anio);
   }
 }
 
