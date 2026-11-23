@@ -198,18 +198,9 @@ function formatRut(rut: string): string {
   return `${num.replace(/\B(?=(\d{3})+(?!\d))/g, ".")}-${dv}`;
 }
 
-const DEFAULT_LOGIN_REDIRECT = "https://misiir.sii.cl/cgi_misii/siihome.cgi";
-
-// redirectTo: algunas apps (p. ej. propuestaf29ui) solo reconocen la sesión si el login
-// se inicia con ellas como destino; con el redirect por defecto responden 302 al login.
-async function login(
-  page: Page,
-  user: string,
-  pass: string,
-  redirectTo: string = DEFAULT_LOGIN_REDIRECT
-): Promise<void> {
+async function login(page: Page, user: string, pass: string): Promise<void> {
   await page.goto(
-    `https://zeusr.sii.cl//AUT2000/InicioAutenticacion/IngresoRutClave.html?${redirectTo}`,
+    "https://zeusr.sii.cl//AUT2000/InicioAutenticacion/IngresoRutClave.html?https://misiir.sii.cl/cgi_misii/siihome.cgi",
     { timeout: PAGE_TIMEOUT_MS }
   );
   await page.locator("#rutcntr").fill(formatRut(user));
@@ -218,12 +209,6 @@ async function login(
     page.waitForNavigation({ timeout: PAGE_TIMEOUT_MS }),
     page.click("#bt_ingresar"),
   ]);
-  if (redirectTo !== DEFAULT_LOGIN_REDIRECT && page.url().includes("zeusr.sii.cl")) {
-    // El redirect a la app puede completarse unos segundos después del load inicial.
-    await page
-      .waitForFunction(() => !location.hostname.includes("zeusr.sii.cl"), { timeout: 10_000 })
-      .catch(() => {});
-  }
   if (page.url().includes("zeusr.sii.cl")) {
     throw new Error("Credenciales SII inválidas o servicio no disponible");
   }
@@ -283,6 +268,32 @@ async function closeBrowserSafely(browser: Browser, label: string): Promise<void
   } catch (e) {
     console.warn(`[${label}] browser.close() no respondió, forzando kill:`, (e as Error).message);
     try { browser.process()?.kill("SIGKILL"); } catch { /* intentional */ }
+  }
+}
+
+// Ejecuta fn con una página de Chromium ya autenticada en el SII. Toma un cupo del
+// semáforo, y SIEMPRE lo libera (incluso si Chromium no arranca o el login falla):
+// lanzar el navegador dentro del try evita que un fallo de arranque filtre el cupo.
+async function conSesionSii<T>(
+  label: string,
+  rut: string,
+  pass: string,
+  fn: (page: Page) => Promise<T>
+): Promise<T> {
+  await sessionSemaphore.acquire();
+  const sessionId = randomUUID();
+  let browser: Browser | null = null;
+  let page: Page | null = null;
+  try {
+    browser = await launchBrowser(sessionId);
+    page = await browser.newPage();
+    await login(page, rut, pass);
+    return await fn(page);
+  } finally {
+    if (page) await logout(page);
+    if (browser) await closeBrowserSafely(browser, `cierre navegador ${label}`);
+    cleanupSession(sessionId);
+    sessionSemaphore.release();
   }
 }
 
@@ -418,10 +429,11 @@ async function fetchRCV(
 
   await sessionSemaphore.acquire();
   const sessionId  = randomUUID();
-  const browser    = await launchBrowser(sessionId);
+  let browser: Browser | null = null;
   let pageRef: Page | null = null;
 
   try {
+    browser = await launchBrowser(sessionId);
     const page = await browser.newPage();
     pageRef = page;
 
@@ -456,7 +468,9 @@ async function fetchRCV(
           try {
             const data = await r.json() as Record<string, unknown>;
             detalleRaw = data;
-            console.log(`[net] getDetalle recibido, keys: ${Object.keys(data)}, snippet: ${JSON.stringify(data).slice(0, 200)}`);
+            // Solo llaves y cantidad de filas: el contenido trae RUT y razones sociales de terceros.
+            const filas = Array.isArray(data.data) ? data.data.length : 0;
+            console.log(`[net] getDetalle recibido, keys: ${Object.keys(data)}, filas: ${filas}`);
           } catch (e) {
             console.warn("[net] getDetalle no-JSON:", (e as Error).message);
           }
@@ -600,7 +614,7 @@ async function fetchRCV(
     // Ignorar errores al cerrar: el portal SII puede tener navegaciones Angular pendientes
     // que generan "Navigation timeout" al cerrar el browser, matando el return exitoso.
     if (pageRef) await logout(pageRef);
-    await closeBrowserSafely(browser, "cierre navegador RCV");
+    if (browser) await closeBrowserSafely(browser, "cierre navegador RCV");
     cleanupSession(sessionId);
     sessionSemaphore.release();
   }
@@ -688,10 +702,11 @@ async function fetchBoletasHonorariosRecibidas(
 ): Promise<object> {
   await sessionSemaphore.acquire();
   const sessionId = randomUUID();
-  const browser = await launchBrowser(sessionId);
+  let browser: Browser | null = null;
   let pageRef: Page | null = null;
 
   try {
+    browser = await launchBrowser(sessionId);
     const page = await browser.newPage();
     pageRef = page;
 
@@ -762,7 +777,7 @@ async function fetchBoletasHonorariosRecibidas(
     };
   } finally {
     if (pageRef) await logout(pageRef);
-    await closeBrowserSafely(browser, "cierre navegador boletas honorarios");
+    if (browser) await closeBrowserSafely(browser, "cierre navegador boletas honorarios");
     cleanupSession(sessionId);
     sessionSemaphore.release();
   }
@@ -805,14 +820,7 @@ function getRcvCredentialsFromBody(
 // ─── Endpoints ───────────────────────────────────────────────────────────────
 
 async function fetchEstadoF29(rut: string, pass: string): Promise<object> {
-  await sessionSemaphore.acquire();
-  const sessionId = randomUUID();
-  const browser = await launchBrowser(sessionId);
-  let pageRef: Page | null = null;
-  try {
-    const page = await browser.newPage();
-    pageRef = page;
-    await login(page, rut, pass);
+  return conSesionSii("F29", rut, pass, async (page) => {
     await page.goto(
       "https://www4.sii.cl/sifmConsultaInternet/index.html?dest=cifxx&form=29",
       { waitUntil: "load", timeout: PAGE_TIMEOUT_MS }
@@ -854,12 +862,7 @@ async function fetchEstadoF29(rut: string, pass: string): Promise<object> {
     }
 
     return { data };
-  } finally {
-    if (pageRef) await logout(pageRef);
-    await closeBrowserSafely(browser, "cierre navegador F29");
-    cleanupSession(sessionId);
-    sessionSemaphore.release();
-  }
+  });
 }
 
 // ─── Declaración F29 de un período (app propuestaf29ui) ──────────────────────
@@ -933,7 +936,6 @@ interface F29DeclaracionRaw {
 }
 
 interface F29TasaPpmRaw {
-  cod115: string | null;
   cod563: string | null;
   esPropyme: boolean;
 }
@@ -945,14 +947,8 @@ function toNumberOrNull(v: string | null | undefined): number | null {
 }
 
 async function fetchDeclaracionF29(rut: string, pass: string, month: string, year: string): Promise<object> {
-  await sessionSemaphore.acquire();
-  const sessionId = randomUUID();
-  const browser = await launchBrowser(sessionId);
-  let pageRef: Page | null = null;
-  try {
-    const page = await browser.newPage();
-    pageRef = page;
-    await login(page, rut, pass, F29_APP_URL);
+  return conSesionSii("declaración F29", rut, pass, async (page) => {
+    await page.goto(F29_APP_URL, { waitUntil: "load", timeout: PAGE_TIMEOUT_MS });
     if (!page.url().includes("propuestaf29ui")) {
       throw new Error("No se pudo abrir la aplicación de declaración F29 del SII (posible cola de espera).");
     }
@@ -985,18 +981,192 @@ async function fetchDeclaracionF29(rut: string, pass: string, month: string, yea
         fechaDeclaracion: d.declFechaCreacion,
       })),
       ppm: {
-        tasa: toNumberOrNull(ppm?.cod115),
+        // No se expone la tasa: cod115 de getTasaPPMO (0,1) no coincide con la tasa
+        // realmente declarada (1%, código 115 del detalle del F29).
         baseVentasNetas: toNumberOrNull(ppm?.cod563),
         esPropyme: ppm?.esPropyme ?? null,
       },
     };
-  } finally {
-    if (pageRef) await logout(pageRef);
-    await closeBrowserSafely(browser, "cierre navegador declaración F29");
-    cleanupSession(sessionId);
-    sessionSemaphore.release();
-  }
+  });
 }
+
+// ─── Detalle por código del F29 vigente (portal rfiInternet/consulta, GWT) ───
+
+const F29_CONSULTA_URL = "https://www4.sii.cl/rfiInternet/consulta/index.html";
+const MESES_ES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto",
+  "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+
+class F29SinVigenteError extends Error {}
+
+// "1.753.554" → 1753554 ; "0,25" → 0.25
+function parseMontoSii(v: string): number | null {
+  const n = Number(v.replace(/\./g, "").replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+// "07/10/2026 17:09:29" → "2026-10-07"
+function fechaSiiAIso(v: string): string | null {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})/.exec(v);
+  return m ? `${m[3]}-${m[2]}-${m[1]}` : null;
+}
+
+// Descarga el detalle del F29 vigente con una página ya autenticada. El portal es una
+// app GWT (RPC serializado), así que se maneja la interfaz: formulario → período →
+// Buscar → folio → "Ver Datos", y se leen los pares código/valor del formulario en
+// pantalla. Nunca se pulsa "Rectificar".
+async function descargarF29Detalle(page: Page, rut: string, month: string, year: string): Promise<object> {
+  const mes = String(Number(month));
+  const [num, dv] = rut.split("-");
+
+  // Historial de declaraciones del período (app propuestaf29ui).
+  await page.goto(F29_APP_URL, { waitUntil: "load", timeout: PAGE_TIMEOUT_MS });
+  if (!page.url().includes("propuestaf29ui")) {
+    throw new Error("No se pudo abrir la aplicación de declaración F29 del SII (posible cola de espera).");
+  }
+  await page.waitForNetworkIdle({ idleTime: 1_500, timeout: 20_000 }).catch(() => {});
+  const declaraciones = await callF29Service<F29DeclaracionRaw[] | null>(
+    page, "FacadeAdapterService", "getDeclaracionConEstados",
+    { rut: num, dv, formId: "2", mes, anno: year }
+  );
+  const lista = Array.isArray(declaraciones) ? declaraciones : [];
+  if (!lista.some((d) => /vigente/i.test(d.estado))) {
+    throw new F29SinVigenteError(`No hay declaración F29 vigente para el período ${year}-${mes.padStart(2, "0")}.`);
+  }
+
+  // Portal de consulta: seleccionar formulario y período, y buscar.
+  await page.goto(F29_CONSULTA_URL, { waitUntil: "load", timeout: PAGE_TIMEOUT_MS });
+  await page.waitForSelector("select", { timeout: PAGE_TIMEOUT_MS });
+  // Al cambiar el año el portal rehace la lista de meses (vuelve al mes actual), por eso
+  // se espera entre cada cambio y se verifica el resultado antes de buscar.
+  const pausa = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  const elegir = async (texto: string) => {
+    for (const sel of await page.$$("select")) {
+      const valor = await sel.evaluate(
+        (s, t) => Array.from(s.options).find((o) => o.text.trim() === t)?.value ?? null,
+        texto
+      );
+      if (valor !== null) {
+        await sel.select(valor);
+        await pausa(1_500);
+        return;
+      }
+    }
+    throw new Error(`Opción no encontrada en el portal SII: ${texto}`);
+  };
+  const mesNombre = MESES_ES[Number(mes) - 1];
+  await elegir("Formulario 29");
+  await elegir(year);
+  await elegir(mesNombre);
+  const elegidos = await page.evaluate(() =>
+    Array.from(document.querySelectorAll("select")).map((s) => s.options[s.selectedIndex].text.trim())
+  );
+  if (!elegidos.includes(year) || !elegidos.includes(mesNombre)) {
+    throw new Error(`El portal SII no conservó el período seleccionado (${elegidos.join(" | ")}).`);
+  }
+  // El clic simulado por Puppeteer no activa este botón GWT; click() desde la página sí.
+  await page.evaluate(() => {
+    const boton = Array.from(document.querySelectorAll("button")).find((b) =>
+      /Buscar Datos Ingresados/.test(b.textContent ?? "")
+    );
+    if (!boton) throw new Error("No se encontró el botón de búsqueda del portal SII.");
+    boton.click();
+  });
+  await page.waitForFunction(
+    () => document.body.innerText.includes("DECLARACIONES VIGENTES"),
+    { timeout: PAGE_TIMEOUT_MS }
+  );
+
+  // Folio vigente: primer enlace numérico de la tabla de resultados.
+  const linkHandle = await page.evaluateHandle(() =>
+    Array.from(document.querySelectorAll("a")).find((a) => /^\d{8,}$/.test(a.textContent?.trim() ?? "")) ?? null
+  );
+  const link = linkHandle.asElement();
+  if (!link) throw new F29SinVigenteError("El portal SII no listó declaraciones vigentes para el período.");
+  const folio = Number((await link.evaluate((a) => a.textContent ?? "")).trim());
+  await (link as unknown as { click(): Promise<void> }).click();
+
+  await page.locator("::-p-text(Ver Datos)").setTimeout(PAGE_TIMEOUT_MS).click();
+  await page.waitForFunction(
+    () => document.body.innerText.includes("TOTAL A PAGAR DENTRO DEL PLAZO LEGAL"),
+    { timeout: PAGE_TIMEOUT_MS }
+  );
+
+  // Pares código/valor del formulario. Cada fila trae [nº línea] [etiqueta] y pares
+  // (código, valor); los códigos sin valor no se muestran (valen 0). Se ignoran las
+  // filas del glosario porque su "valor" es texto.
+  const crudos = await page.evaluate(() => {
+    const isCode = (t: string) => /^[1-9]\d{1,3}$/.test(t);
+    const isNum = (t: string) => /^-?\d{1,3}(\.\d{3})*(,\d+)?$|^-?\d+(,\d+)?$/.test(t);
+    const out: Record<string, string> = {};
+    const rows = Array.from(document.querySelectorAll("tr")).filter((r) => !r.querySelector("tr"));
+    for (const r of rows) {
+      const cells = Array.from(r.children).map((c) => {
+        const input = c.querySelector("input");
+        return input ? input.value.trim() : (c as HTMLElement).innerText.trim().replace(/\s+/g, " ");
+      });
+      let start = 0;
+      if (cells.length >= 3 && /^\d{1,2}$/.test(cells[0]) && cells[1].length > 3 && !isCode(cells[1])) start = 2;
+      else if (cells.length >= 2 && !isCode(cells[0]) && cells[0].length > 3) start = 1;
+      for (let k = start; k < cells.length - 1; k++) {
+        if (isCode(cells[k]) && isNum(cells[k + 1])) {
+          out[cells[k]] = cells[k + 1];
+          k++;
+        }
+      }
+    }
+    return out;
+  });
+  const codigos: Record<string, number> = {};
+  for (const [codigo, valor] of Object.entries(crudos)) {
+    const n = parseMontoSii(valor);
+    if (n !== null) codigos[codigo] = n;
+  }
+
+  const vigente = lista.find((d) => /vigente/i.test(d.estado))!;
+  const anteriores = lista.filter((d) => d !== vigente);
+  return {
+    periodo: `${year}-${mes.padStart(2, "0")}`,
+    vigente: {
+      folio,
+      fechaDeclaracion: fechaSiiAIso(vigente.declFechaCreacion),
+      // Inferido: si el período tiene otras declaraciones, la vigente es rectificatoria.
+      tipo: anteriores.length > 0 ? "rectificatoria" : "original",
+    },
+    codigos,
+    historial: anteriores.map((d) => ({
+      folio: d.folio,
+      fecha: fechaSiiAIso(d.declFechaCreacion),
+      estado: d.estado.toLowerCase(),
+    })),
+    origen: {
+      servicio: `${F29_CONSULTA_URL} (Formulario 29 → Ver Datos)`,
+      descargado: new Date().toISOString(),
+    },
+  };
+}
+
+app.post("/api/F29/detalle/:month/:year", requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
+  const { month, year } = req.params;
+  if (!validateRcvParams(month, year, res)) return;
+  const creds = getRcvCredentialsFromBody(req.body, res);
+  if (!creds) return;
+  if (!checkRutCooldown(creds.user, res)) return;
+  try {
+    const data = await withTimeout(
+      conSesionSii("detalle F29", creds.user, creds.pass, (page) =>
+        descargarF29Detalle(page, creds.user, month, year)
+      ),
+      REQUEST_TIMEOUT_MS,
+      "consulta detalle F29"
+    );
+    res.json(data);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Error desconocido";
+    console.error("[/api/F29/detalle] Error:", message);
+    const status = err instanceof F29SinVigenteError ? 404 : message.includes("inválidas") ? 401 : 500;
+    res.status(status).json({ error: message });
+  }
+});
 
 app.post("/api/F29/declaracion/:month/:year", requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
   const { month, year } = req.params;
