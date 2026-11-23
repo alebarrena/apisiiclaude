@@ -198,9 +198,18 @@ function formatRut(rut: string): string {
   return `${num.replace(/\B(?=(\d{3})+(?!\d))/g, ".")}-${dv}`;
 }
 
-async function login(page: Page, user: string, pass: string): Promise<void> {
+const DEFAULT_LOGIN_REDIRECT = "https://misiir.sii.cl/cgi_misii/siihome.cgi";
+
+// redirectTo: algunas apps (p. ej. propuestaf29ui) solo reconocen la sesión si el login
+// se inicia con ellas como destino; con el redirect por defecto responden 302 al login.
+async function login(
+  page: Page,
+  user: string,
+  pass: string,
+  redirectTo: string = DEFAULT_LOGIN_REDIRECT
+): Promise<void> {
   await page.goto(
-    "https://zeusr.sii.cl//AUT2000/InicioAutenticacion/IngresoRutClave.html?https://misiir.sii.cl/cgi_misii/siihome.cgi",
+    `https://zeusr.sii.cl//AUT2000/InicioAutenticacion/IngresoRutClave.html?${redirectTo}`,
     { timeout: PAGE_TIMEOUT_MS }
   );
   await page.locator("#rutcntr").fill(formatRut(user));
@@ -209,6 +218,12 @@ async function login(page: Page, user: string, pass: string): Promise<void> {
     page.waitForNavigation({ timeout: PAGE_TIMEOUT_MS }),
     page.click("#bt_ingresar"),
   ]);
+  if (redirectTo !== DEFAULT_LOGIN_REDIRECT && page.url().includes("zeusr.sii.cl")) {
+    // El redirect a la app puede completarse unos segundos después del load inicial.
+    await page
+      .waitForFunction(() => !location.hostname.includes("zeusr.sii.cl"), { timeout: 10_000 })
+      .catch(() => {});
+  }
   if (page.url().includes("zeusr.sii.cl")) {
     throw new Error("Credenciales SII inválidas o servicio no disponible");
   }
@@ -846,6 +861,163 @@ async function fetchEstadoF29(rut: string, pass: string): Promise<object> {
     sessionSemaphore.release();
   }
 }
+
+// ─── Declaración F29 de un período (app propuestaf29ui) ──────────────────────
+
+const F29_APP_URL = "https://www4.sii.cl/propuestaf29ui/internet/";
+const F29_NS = "cl.sii.sdi.lob.iva.propuestaf29.data.api.interfaces";
+
+interface F29Envelope<T> {
+  data: T;
+  metaData?: { errors?: unknown };
+}
+
+// Llama a un servicio JSON de la app desde el contexto de la página (cookies de sesión).
+// Las rutas usan la inicial en minúscula (facadeAdapterService) y el namespace en mayúscula.
+async function callF29Service<T>(
+  page: Page,
+  service: string,
+  method: string,
+  data: Record<string, unknown>
+): Promise<T> {
+  const run = () => page.evaluate(
+    async (ns, svc, mth, payload) => {
+      const body = {
+        metaData: {
+          namespace: `${ns}.${svc}/${mth}`,
+          conversationId: `X${Math.random().toString(36).slice(2, 12).toUpperCase()}`,
+          transactionId: crypto.randomUUID(),
+        },
+        data: payload,
+      };
+      const r = await fetch(`/propuestaf29ui/services/data/${svc.charAt(0).toLowerCase()}${svc.slice(1)}/${mth}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(body),
+        credentials: "include",
+      });
+      return { status: r.status, text: await r.text() };
+    },
+    F29_NS,
+    service,
+    method,
+    data
+  );
+  let result: { status: number; text: string };
+  try {
+    result = await run();
+  } catch {
+    await new Promise((r) => setTimeout(r, 3_000));
+    result = await run();
+  }
+  if (result.status !== 200) {
+    throw new Error(`El SII respondió ${result.status} en ${method}`);
+  }
+  let parsed: F29Envelope<T>;
+  try {
+    parsed = JSON.parse(result.text) as F29Envelope<T>;
+  } catch {
+    throw new Error(`Respuesta no válida del SII en ${method}`);
+  }
+  if (parsed.metaData?.errors) {
+    throw new Error(`El SII devolvió un error en ${method}`);
+  }
+  return parsed.data;
+}
+
+interface F29DeclaracionRaw {
+  estado: string;
+  monto: number;
+  folio: number;
+  declFechaCreacion: string;
+}
+
+interface F29TasaPpmRaw {
+  cod115: string | null;
+  cod563: string | null;
+  esPropyme: boolean;
+}
+
+function toNumberOrNull(v: string | null | undefined): number | null {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function fetchDeclaracionF29(rut: string, pass: string, month: string, year: string): Promise<object> {
+  await sessionSemaphore.acquire();
+  const sessionId = randomUUID();
+  const browser = await launchBrowser(sessionId);
+  let pageRef: Page | null = null;
+  try {
+    const page = await browser.newPage();
+    pageRef = page;
+    await login(page, rut, pass, F29_APP_URL);
+    if (!page.url().includes("propuestaf29ui")) {
+      throw new Error("No se pudo abrir la aplicación de declaración F29 del SII (posible cola de espera).");
+    }
+
+    // La SPA sigue redirigiendo internamente tras el login; un fetch lanzado antes de que
+    // se asiente falla con "Failed to fetch".
+    await page.waitForNetworkIdle({ idleTime: 1_500, timeout: 20_000 }).catch(() => {});
+
+    const [num, dv] = rut.split("-");
+    const mes = String(Number(month));
+    const anno = String(year);
+
+    const declaraciones = await callF29Service<F29DeclaracionRaw[] | null>(
+      page, "FacadeAdapterService", "getDeclaracionConEstados",
+      { rut: num, dv, formId: "2", mes, anno }
+    );
+    const ppm = await callF29Service<F29TasaPpmRaw | null>(
+      page, "FacadeAdapterService", "getTasaPPMO",
+      { rutContribuyente: num, dv, mes, anno, categoriaTributaria: 1, tipoFormulario: "FMNINT" }
+    );
+
+    const lista = Array.isArray(declaraciones) ? declaraciones : [];
+    return {
+      periodo: `${anno}${mes.padStart(2, "0")}`,
+      estado: lista.length > 0 ? "declarado" : "sinDeclaracion",
+      declaraciones: lista.map((d) => ({
+        estado: d.estado,
+        monto: d.monto,
+        folio: d.folio,
+        fechaDeclaracion: d.declFechaCreacion,
+      })),
+      ppm: {
+        tasa: toNumberOrNull(ppm?.cod115),
+        baseVentasNetas: toNumberOrNull(ppm?.cod563),
+        esPropyme: ppm?.esPropyme ?? null,
+      },
+    };
+  } finally {
+    if (pageRef) await logout(pageRef);
+    await closeBrowserSafely(browser, "cierre navegador declaración F29");
+    cleanupSession(sessionId);
+    sessionSemaphore.release();
+  }
+}
+
+app.post("/api/F29/declaracion/:month/:year", requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
+  const { month, year } = req.params;
+  if (!validateRcvParams(month, year, res)) return;
+  const creds = getRcvCredentialsFromBody(req.body, res);
+  if (!creds) return;
+  if (!checkRutCooldown(creds.user, res)) return;
+  try {
+    const data = await withTimeout(
+      fetchDeclaracionF29(creds.user, creds.pass, month, year),
+      REQUEST_TIMEOUT_MS,
+      "consulta declaración F29"
+    );
+    res.json(data);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Error desconocido";
+    console.error("[/api/F29/declaracion] Error:", message);
+    const status = message.includes("inválidas") ? 401 : 500;
+    res.status(status).json({ error: message });
+  }
+});
 
 app.post("/getEstadoF29", requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
   const { rut, pass } = req.body as { rut?: string; pass?: string };
