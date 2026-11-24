@@ -1,6 +1,6 @@
 import express, { Express, NextFunction, Request, Response } from "express";
 import dotenv from "dotenv";
-import puppeteer, { Browser, executablePath, HTTPResponse, Page } from "puppeteer";
+import puppeteer, { Browser, Dialog, executablePath, HTTPResponse, Page } from "puppeteer";
 import { parse } from "node-html-parser";
 import path from "path";
 import os from "node:os";
@@ -206,6 +206,22 @@ function formatRut(rut: string): string {
   return `${num.replace(/\B(?=(\d{3})+(?!\d))/g, ".")}-${dv}`;
 }
 
+// Error de ingreso al SII, con el código HTTP que corresponde devolver al cliente.
+class SiiLoginError extends Error {
+  constructor(message: string, readonly status: 401 | 409 | 503) {
+    super(message);
+  }
+}
+
+const ESPERA_INGRESO_MS = 20_000;
+// Palabras con que el SII rechaza RUT o clave (en el formulario o en un diálogo). El texto
+// fijo de la pantalla de ingreso no contiene ninguna de ellas.
+const RECHAZO_CLAVE = /incorrect|inv[aá]lid|err[oó]ne|no coincide|bloquead|intentos fallidos/i;
+
+// Ingresa con RUT y clave tributaria. Si el ingreso no se completa, distingue una clave rechazada
+// (401) de una pantalla intermedia del SII (409) y de un SII que no responde o limita los
+// ingresos (503). No pulsa nada en las pantallas intermedias: la persona debe completarlas en
+// sii.cl. En el log va solo la ruta y el título de la pantalla, nunca el RUT ni la clave.
 async function login(page: Page, user: string, pass: string): Promise<void> {
   await page.goto(
     "https://zeusr.sii.cl//AUT2000/InicioAutenticacion/IngresoRutClave.html?https://misiir.sii.cl/cgi_misii/siihome.cgi",
@@ -213,13 +229,99 @@ async function login(page: Page, user: string, pass: string): Promise<void> {
   );
   await page.locator("#rutcntr").fill(formatRut(user));
   await page.locator("#clave").fill(pass);
-  await Promise.all([
-    page.waitForNavigation({ timeout: PAGE_TIMEOUT_MS }),
-    page.click("#bt_ingresar"),
-  ]);
-  if (page.url().includes("zeusr.sii.cl")) {
-    throw new Error("Credenciales SII inválidas o servicio no disponible");
+
+  // Un diálogo JS sin cerrar bloquearía la página: se guarda su mensaje y se cierra.
+  let dialogo = "";
+  const onDialog = (d: Dialog) => {
+    dialogo = d.message();
+    d.dismiss().catch(() => {});
+  };
+  page.on("dialog", onDialog);
+  try {
+    await Promise.all([
+      page.waitForNavigation({ timeout: 30_000 }).catch(() => null),
+      page.click("#bt_ingresar"),
+    ]);
+    // El ingreso puede redirigir en varios saltos: esperar a salir de zeusr, a un mensaje de
+    // rechazo o a que venza el plazo.
+    let eligioIngresoPropio = false;
+    const limite = Date.now() + ESPERA_INGRESO_MS;
+    while (page.url().includes("zeusr.sii.cl") && Date.now() < limite) {
+      if (RECHAZO_CLAVE.test(dialogo)) break;
+      const texto = await page.evaluate(() => document.body?.innerText ?? "").catch(() => "");
+      if (RECHAZO_CLAVE.test(texto)) break;
+      // A quien está autorizado a representar a otros contribuyentes, el SII le pregunta cómo
+      // ingresar. "Continuar" = trámites propios: es lo que hace la persona en el navegador y no
+      // cambia nada en la cuenta. Es la única pantalla intermedia en la que se pulsa algo.
+      if (!eligioIngresoPropio && /escoja c[oó]mo desea ingresar/i.test(texto)) {
+        eligioIngresoPropio = await page
+          .evaluate(() => {
+            const boton = Array.from(document.querySelectorAll("button, a, input[type=button], input[type=submit]"))
+              .find((e) => ((e as HTMLInputElement).value || e.textContent || "").trim() === "Continuar");
+            if (!boton) return false;
+            (boton as HTMLElement).click();
+            return true;
+          })
+          .catch(() => false);
+        if (eligioIngresoPropio) {
+          console.log("[login] pantalla «Escoja cómo desea ingresar»: se continúa con trámites propios");
+          await page.waitForNavigation({ timeout: 30_000 }).catch(() => null);
+          continue;
+        }
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  } finally {
+    page.off("dialog", onDialog);
   }
+
+  const url = new URL(page.url());
+  if (!url.hostname.includes("zeusr.sii.cl")) {
+    // Con muchos ingresos seguidos el SII redirige a una página de ayuda en vez de Mi SII.
+    if (url.pathname.startsWith("/ayudas/")) {
+      console.warn(`[login] el SII redirigió a ${url.pathname} (límite de ingresos seguidos)`);
+      throw new SiiLoginError(
+        "El SII está limitando los ingresos seguidos con este RUT. Espere unos 20 minutos antes de reintentar.",
+        503
+      );
+    }
+    return;
+  }
+
+  const pantalla = await page
+    .evaluate(() => ({
+      // Primer encabezado visible (el document.title de estas pantallas es siempre "Autenticación").
+      titulo: (
+        Array.from(document.querySelectorAll("h1, h2, h3, h4, legend"))
+          .find((e) => (e as HTMLElement).offsetParent !== null && (e.textContent ?? "").trim() !== "")
+          ?.textContent || document.title || ""
+      ).trim().replace(/\s+/g, " ").slice(0, 120),
+      texto: document.body?.innerText ?? "",
+      hayFormulario: !!document.querySelector("#rutcntr") && !!document.querySelector("#clave"),
+    }))
+    .catch(() => null);
+  console.warn(`[login] ingreso no completado: ruta=${url.pathname} titulo=${pantalla?.titulo || "(sin respuesta)"}`);
+
+  if (!pantalla || pantalla.texto.trim() === "") {
+    throw new SiiLoginError("El SII no respondió al ingreso. Reintente en unos minutos.", 503);
+  }
+  // Si vuelve el formulario de ingreso, el SII no aceptó el RUT o la clave.
+  if (RECHAZO_CLAVE.test(dialogo) || RECHAZO_CLAVE.test(pantalla.texto) || pantalla.hayFormulario) {
+    throw new SiiLoginError(
+      "El SII rechazó la clave (RUT o clave incorrectos, o clave bloqueada). No reintente con la misma clave: varios intentos fallidos la bloquean.",
+      401
+    );
+  }
+  throw new SiiLoginError(
+    `El SII pide un paso adicional en el ingreso: «${pantalla.titulo || "pantalla sin título"}». Entre una vez a sii.cl con esa clave y complételo.`,
+    409
+  );
+}
+
+function estadoHttpDeError(err: unknown): number {
+  if (err instanceof SiiLoginError) return err.status;
+  if (err instanceof SinDeclaracionError) return 404;
+  return 500;
 }
 
 // El SII mantiene la sesión activa en su servidor aunque cerremos el browser.
@@ -1280,7 +1382,7 @@ app.post("/api/F29/detalle/:month/:year", requireApiKey, heavyLimiter, async (re
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
     console.error("[/api/F29/detalle] Error:", message);
-    const status = err instanceof SinDeclaracionError ? 404 : message.includes("inválidas") ? 401 : 500;
+    const status = estadoHttpDeError(err);
     res.status(status).json({ error: message });
   }
 });
@@ -1547,7 +1649,9 @@ async function descargarTerceros(page: Page, rut: string, at: string): Promise<o
   await page.waitForNetworkIdle({ idleTime: 2_000, timeout: 20_000 }).catch(() => {});
   const [num, dv] = rut.split("-");
 
-  const entradas = await callTercerosService<AgenteRetenedorRaw[] | null>(page, "getAgenteRetenedor", { periodo: at });
+  // El período va como AT + "00" (es lo que envía la propia app). Con solo el AT el SII
+  // responde 200 pero vacío.
+  const entradas = await callTercerosService<AgenteRetenedorRaw[] | null>(page, "getAgenteRetenedor", { periodo: `${at}00` });
   const djs: object[] = [];
   for (const entrada of Array.isArray(entradas) ? entradas : []) {
     for (const [dj, info] of Object.entries(entrada.listAgenteRetenedor ?? {})) {
@@ -1572,9 +1676,13 @@ async function descargarTerceros(page: Page, rut: string, at: string): Promise<o
       } catch (err) {
         error = err instanceof Error ? err.message : "Error desconocido";
       }
+      // Algunos títulos llegan con UTF-8 leído como Latin-1 ("EnajenaciÃ³n"): se recodifican.
+      const titulo = entrada.title?.includes("Ã")
+        ? Buffer.from(entrada.title, "latin1").toString("utf8")
+        : entrada.title ?? null;
       djs.push({
         dj: Number(dj),
-        titulo: entrada.title ?? null,
+        titulo,
         resumen: resumen?.tabla ?? null,
         detalle,
         ...(error ? { error } : {}),
@@ -1615,7 +1723,7 @@ function rutaPorAnioTributario(
     } catch (err) {
       const message = err instanceof Error ? err.message : "Error desconocido";
       console.error(`[${ruta}] Error:`, message);
-      const status = err instanceof SinDeclaracionError ? 404 : message.includes("inválidas") ? 401 : 500;
+      const status = estadoHttpDeError(err);
       res.status(status).json({ error: message });
     }
   });
@@ -1643,7 +1751,7 @@ app.post("/api/F29/declaracion/:month/:year", requireApiKey, heavyLimiter, async
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
     console.error("[/api/F29/declaracion] Error:", message);
-    const status = message.includes("inválidas") ? 401 : 500;
+    const status = estadoHttpDeError(err);
     res.status(status).json({ error: message });
   }
 });
@@ -1665,7 +1773,7 @@ app.post("/getEstadoF29", requireApiKey, heavyLimiter, async (req: Request, res:
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
     console.error("[/getEstadoF29] Error:", message);
-    const status = message.includes("inválidas") ? 401 : 500;
+    const status = estadoHttpDeError(err);
     res.status(status).json({ error: message });
   }
 });
@@ -1687,7 +1795,7 @@ app.post("/api/RCV/compras/:month/:year", requireApiKey, heavyLimiter, async (re
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
     console.error("[/api/RCV/compras] Error:", message);
-    const status = message.includes("inválidas") ? 401 : 500;
+    const status = estadoHttpDeError(err);
     res.status(status).json({ error: message });
   }
 });
@@ -1709,7 +1817,7 @@ app.post("/api/RCV/ventas/:month/:year", requireApiKey, heavyLimiter, async (req
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
     console.error("[/api/RCV/ventas] Error:", message);
-    const status = message.includes("inválidas") ? 401 : 500;
+    const status = estadoHttpDeError(err);
     res.status(status).json({ error: message });
   }
 });
@@ -1730,7 +1838,7 @@ app.post("/api/boletas/recibidas/:month/:year", requireApiKey, heavyLimiter, asy
   } catch (err) {
     const message = err instanceof Error ? err.message : "Error desconocido";
     console.error("[/api/boletas/recibidas] Error:", message);
-    const status = message.includes("inválidas") ? 401 : 500;
+    const status = estadoHttpDeError(err);
     res.status(status).json({ error: message });
   }
 });
