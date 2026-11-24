@@ -5,7 +5,7 @@ import { parse } from "node-html-parser";
 import path from "path";
 import os from "node:os";
 import fs from "node:fs";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 
@@ -1006,6 +1006,7 @@ interface F29DeclaracionRaw {
   estado: string;
   monto: number;
   folio: number;
+  codigo: number;
   declFechaCreacion: string;
 }
 
@@ -1082,6 +1083,40 @@ function parseMontoSii(v: string): number | null {
 function fechaSiiAIso(v: string): string | null {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})/.exec(v);
   return m ? `${m[3]}-${m[2]}-${m[1]}` : null;
+}
+
+// Formulario compacto en PDF (el que abre el botón "Formulario Compacto" de la Consulta Integral),
+// como evidencia. La página debe estar en www4.sii.cl para que la petición vaya con la sesión.
+// Si el SII no devuelve un PDF se omite (devuelve null) sin tumbar la descarga principal.
+async function descargarFormCompactoPdf(
+  page: Page,
+  rut: string,
+  folio: number,
+  codigoInterno: number,
+  form: string,
+  nombre: string
+): Promise<{ nombre: string; sha256: string; base64: string } | null> {
+  try {
+    const url = `https://www4.sii.cl/rfiInternet/formCompacto?folio=${folio}&rut=${rut.split("-")[0]}&form=${form}&codInt=${codigoInterno}`;
+    const r = await page.evaluate(async (u: string) => {
+      const resp = await fetch(u, { credentials: "include" });
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      }
+      return { status: resp.status, tipo: resp.headers.get("content-type") ?? "", base64: btoa(bin) };
+    }, url);
+    const buffer = Buffer.from(r.base64, "base64");
+    if (r.status !== 200 || !r.tipo.includes("pdf") || buffer.subarray(0, 4).toString() !== "%PDF") {
+      console.warn(`[formCompacto] el SII no devolvió un PDF (HTTP ${r.status}, ${r.tipo || "sin tipo"}).`);
+      return null;
+    }
+    return { nombre, sha256: createHash("sha256").update(buffer).digest("hex"), base64: r.base64 };
+  } catch (e) {
+    console.warn("[formCompacto] no se pudo descargar el PDF:", (e as Error).message);
+    return null;
+  }
 }
 
 // Descarga el detalle del F29 vigente con una página ya autenticada. El portal es una
@@ -1169,7 +1204,9 @@ async function descargarF29Detalle(page: Page, rut: string, month: string, year:
   // (código, valor); los códigos sin valor no se muestran (valen 0). Se ignoran las
   // filas del glosario porque su "valor" es texto.
   const crudos = await page.evaluate(() => {
-    const isCode = (t: string) => /^[1-9]\d{1,3}$/.test(t);
+    // Códigos del 16 en adelante: 1–15 son la carátula (la fila del período, p. ej. mes 10 con
+    // el año como valor, se leería como un código si no se excluyera).
+    const isCode = (t: string) => /^(1[6-9]|[2-9]\d|[1-9]\d{2,3})$/.test(t);
     const isNum = (t: string) => /^-?\d{1,3}(\.\d{3})*(,\d+)?$|^-?\d+(,\d+)?$/.test(t);
     const out: Record<string, string> = {};
     const rows = Array.from(document.querySelectorAll("tr")).filter((r) => !r.querySelector("tr"));
@@ -1198,15 +1235,21 @@ async function descargarF29Detalle(page: Page, rut: string, month: string, year:
 
   const vigente = lista.find((d) => /vigente/i.test(d.estado))!;
   const anteriores = lista.filter((d) => d !== vigente);
+  // Solo cuenta como rectificatoria si reemplazó a otra declaración que llegó a estar vigente:
+  // una declaración "rechazada por pago inconcluso" nunca fue vigente (inferido del estado).
+  const reemplazo = anteriores.some((d) => /reemplaz|rectific/i.test(d.estado));
+  const archivo = await descargarFormCompactoPdf(
+    page, rut, folio, vigente.codigo, "029", `F29_${rut}_${year}-${mes.padStart(2, "0")}_${folio}.pdf`
+  );
   return {
     periodo: `${year}-${mes.padStart(2, "0")}`,
     vigente: {
       folio,
       fechaDeclaracion: fechaSiiAIso(vigente.declFechaCreacion),
-      // Inferido: si el período tiene otras declaraciones, la vigente es rectificatoria.
-      tipo: anteriores.length > 0 ? "rectificatoria" : "original",
+      tipo: reemplazo ? "rectificatoria" : "original",
     },
     codigos,
+    ...(archivo ? { archivo } : {}),
     historial: anteriores.map((d) => ({
       folio: d.folio,
       fecha: fechaSiiAIso(d.declFechaCreacion),
@@ -1461,6 +1504,93 @@ async function descargarDDJJEstado(page: Page, rut: string, at: string): Promise
   };
 }
 
+// ─── Información de terceros (djconsultarentaui) ─────────────────────────────
+// Lo que terceros (empleadores, bancos, AFP, sociedades) informaron del contribuyente en sus DDJJ:
+// la pantalla "Información para declarar" del SII. Las tablas se devuelven CRUDAS (tabla de
+// presentación con celdas colspan/rowspan): la interpretación de columnas queda en el consumidor.
+// Implementado según la especificación del documento de requerimientos; con la cuenta de prueba
+// (empresa) el servicio responde vacío, así que la forma con datos no está validada aquí.
+
+const TERCEROS_NS = "cl.sii.sdi.lob.renta.djconsultarenta.data.api.interfaces.FacadeService";
+const TERCEROS_MAX_PAGINAS = 20;
+
+interface TerceroTablaRaw {
+  tabla?: unknown;
+  cantRegistros?: number;
+  cantidadFilas?: number;
+}
+
+interface AgenteRetenedorRaw {
+  title?: string;
+  listAgenteRetenedor?: Record<string, { resumen?: TerceroTablaRaw; key?: number }>;
+}
+
+interface DjDetalleTerceroRaw {
+  listDetalle?: { DETALLE?: { detalle?: TerceroTablaRaw } };
+}
+
+function callTercerosService<T>(page: Page, method: string, data: Record<string, unknown>): Promise<T> {
+  return llamarServicioSii<T>(
+    page,
+    `/djconsultarentaui/services/data/facadeService/${method}`,
+    `${TERCEROS_NS}/${method}`,
+    method,
+    data
+  );
+}
+
+async function descargarTerceros(page: Page, rut: string, at: string): Promise<object> {
+  await page.goto(`https://www4.sii.cl/djconsultarentaui/internet/#/agenteretenedor/resumen/${at}`, {
+    waitUntil: "load",
+    timeout: PAGE_TIMEOUT_MS,
+  });
+  await page.waitForNetworkIdle({ idleTime: 2_000, timeout: 20_000 }).catch(() => {});
+  const [num, dv] = rut.split("-");
+
+  const entradas = await callTercerosService<AgenteRetenedorRaw[] | null>(page, "getAgenteRetenedor", { periodo: at });
+  const djs: object[] = [];
+  for (const entrada of Array.isArray(entradas) ? entradas : []) {
+    for (const [dj, info] of Object.entries(entrada.listAgenteRetenedor ?? {})) {
+      const resumen = info.resumen;
+      const detalle: unknown[] = [];
+      let error: string | undefined;
+      try {
+        const total = resumen?.cantRegistros ?? 0;
+        const porPagina = resumen?.cantidadFilas ?? 0;
+        const paginas = Math.min(
+          TERCEROS_MAX_PAGINAS,
+          total > 0 && porPagina > 0 ? Math.ceil(total / porPagina) : 1
+        );
+        for (let p = 1; p <= paginas; p++) {
+          const d = await callTercerosService<DjDetalleTerceroRaw | null>(page, "getDjDetalle", {
+            periodo: `${at}00`, rut: num, dv, dj: Number(dj), page: p, key: info.key ?? 0, seccion: "", tipoConsulta: 2,
+          });
+          const tabla = d?.listDetalle?.DETALLE?.detalle?.tabla;
+          if (!tabla) break;
+          detalle.push(tabla);
+        }
+      } catch (err) {
+        error = err instanceof Error ? err.message : "Error desconocido";
+      }
+      djs.push({
+        dj: Number(dj),
+        titulo: entrada.title ?? null,
+        resumen: resumen?.tabla ?? null,
+        detalle,
+        ...(error ? { error } : {}),
+      });
+    }
+  }
+  return {
+    at: Number(at),
+    djs,
+    origen: {
+      servicio: "https://www4.sii.cl/djconsultarentaui/internet/ (getAgenteRetenedor, getDjDetalle)",
+      descargado: new Date().toISOString(),
+    },
+  };
+}
+
 function rutaPorAnioTributario(
   ruta: string,
   etiqueta: string,
@@ -1494,6 +1624,7 @@ function rutaPorAnioTributario(
 rutaPorAnioTributario("/api/F22/detalle/:at", "detalle F22", descargarF22Detalle);
 rutaPorAnioTributario("/api/F22/estado/:at", "estado F22", descargarF22Estado);
 rutaPorAnioTributario("/api/DDJJ/estado/:at", "estado DDJJ", descargarDDJJEstado);
+rutaPorAnioTributario("/api/terceros/:at", "información de terceros", descargarTerceros);
 rutaPorAnioTributario("/api/boletas/recibidas-anual/:at", "informe anual BHE", (page, _rut, anio) => descargarBHEAnual(page, anio));
 
 app.post("/api/F29/declaracion/:month/:year", requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
@@ -1608,13 +1739,13 @@ app.post("/api/boletas/recibidas/:month/:year", requireApiKey, heavyLimiter, asy
 
 type TipoLote =
   | "f29_detalle" | "rcv_compras" | "rcv_ventas" | "bhe_recibidas"
-  | "f22_detalle" | "f22_estado" | "ddjj_estado" | "bhe_anual";
+  | "f22_detalle" | "f22_estado" | "ddjj_estado" | "bhe_anual" | "terceros";
 const TIPOS_LOTE: readonly TipoLote[] = [
   "f29_detalle", "rcv_compras", "rcv_ventas", "bhe_recibidas",
-  "f22_detalle", "f22_estado", "ddjj_estado", "bhe_anual",
+  "f22_detalle", "f22_estado", "ddjj_estado", "bhe_anual", "terceros",
 ];
 // Tipos anuales: `anio` es el año tributario y no llevan mes.
-const TIPOS_LOTE_ANUALES: readonly TipoLote[] = ["f22_detalle", "f22_estado", "ddjj_estado", "bhe_anual"];
+const TIPOS_LOTE_ANUALES: readonly TipoLote[] = ["f22_detalle", "f22_estado", "ddjj_estado", "bhe_anual", "terceros"];
 const LOTE_MAX_ITEMS = 50;
 const LOTE_ITEM_TIMEOUT_MS = 180_000;
 const LOTE_PAUSA_ENTRE_ITEMS_MS = 2_000;
@@ -1708,6 +1839,8 @@ function descargarItemLote(page: Page, rut: string, item: ItemLote): Promise<obj
       return descargarDDJJEstado(page, rut, anio);
     case "bhe_anual":
       return descargarBHEAnual(page, anio);
+    case "terceros":
+      return descargarTerceros(page, rut, anio);
   }
 }
 
