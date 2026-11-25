@@ -1627,8 +1627,6 @@ function textoSii(s: string | null | undefined): string | null {
 }
 
 const TERCEROS_NS = "cl.sii.sdi.lob.renta.djconsultarenta.data.api.interfaces.FacadeService";
-const TERCEROS_MAX_PAGINAS = 20;
-
 interface TerceroTablaRaw {
   tabla?: unknown;
   cantRegistros?: number;
@@ -1637,11 +1635,8 @@ interface TerceroTablaRaw {
 
 interface AgenteRetenedorRaw {
   title?: string;
+  formKey?: number | string;
   listAgenteRetenedor?: Record<string, { resumen?: TerceroTablaRaw; key?: number }>;
-}
-
-interface DjDetalleTerceroRaw {
-  listDetalle?: { DETALLE?: { detalle?: TerceroTablaRaw } };
 }
 
 function callTercerosService<T>(page: Page, method: string, data: Record<string, unknown>): Promise<T> {
@@ -1669,23 +1664,19 @@ async function descargarTerceros(page: Page, rut: string, at: string): Promise<o
   for (const entrada of Array.isArray(entradas) ? entradas : []) {
     for (const [dj, info] of Object.entries(entrada.listAgenteRetenedor ?? {})) {
       const resumen = info.resumen;
-      const detalle: unknown[] = [];
+      let detalle: object[] = [];
       let error: string | undefined;
       try {
-        const total = resumen?.cantRegistros ?? 0;
-        const porPagina = resumen?.cantidadFilas ?? 0;
-        const paginas = Math.min(
-          TERCEROS_MAX_PAGINAS,
-          total > 0 && porPagina > 0 ? Math.ceil(total / porPagina) : 1
+        // La app del SII pide el detalle con el formKey de la entrada; con key 0 algunas DJ
+        // (p. ej. 1947) responden sin detalle.
+        const r = await descargarSeccionesDj(
+          page,
+          { periodo: `${at}00`, rut: num, dv, dj: Number(dj), key: entrada.formKey ?? info.key ?? 0 },
+          2,
+          (resumen?.cantRegistros ?? 0) > 0
         );
-        for (let p = 1; p <= paginas; p++) {
-          const d = await callTercerosService<DjDetalleTerceroRaw | null>(page, "getDjDetalle", {
-            periodo: `${at}00`, rut: num, dv, dj: Number(dj), page: p, key: info.key ?? 0, seccion: "", tipoConsulta: 2,
-          });
-          const tabla = d?.listDetalle?.DETALLE?.detalle?.tabla;
-          if (!tabla) break;
-          detalle.push(tabla);
-        }
+        detalle = r.secciones;
+        error = r.error;
       } catch (err) {
         error = err instanceof Error ? err.message : "Error desconocido";
       }
@@ -1742,14 +1733,37 @@ interface DjObservacionRaw {
   glosaObservacion?: string | null;
 }
 
-async function descargarSeccionesDj(page: Page, base: Record<string, unknown>): Promise<object[]> {
+// Secciones que se prueban si la primera llamada no trae ninguna pero el resumen dice que hay casos.
+const SECCIONES_DJ_CONOCIDAS = ["SECCIÓN B", "SECCION B", "DETALLE"];
+
+// tipoConsulta 1 = DJ propia; 2 = lo que un tercero informó del contribuyente.
+async function descargarSeccionesDj(
+  page: Page,
+  base: Record<string, unknown>,
+  tipoConsulta: 1 | 2,
+  hayCasos = false
+): Promise<{ secciones: object[]; error?: string }> {
   const pedir = (p: number, seccion: string) =>
     callTercerosService<{ listDetalle?: TablasPorSeccionRaw } | null>(page, "getDjDetalle", {
-      ...base, page: p, seccion, tipoConsulta: 1,
+      ...base, page: p, seccion, tipoConsulta,
     });
-  const primera = await pedir(1, "");
+  const conTabla = (l?: TablasPorSeccionRaw) =>
+    Object.values(l ?? {}).some((ts) => Object.values(ts ?? {}).some((t) => t?.tabla));
+  let listDetalle = (await pedir(1, ""))?.listDetalle;
+  if (!conTabla(listDetalle) && hayCasos) {
+    for (const s of SECCIONES_DJ_CONOCIDAS) {
+      const l = (await pedir(1, s))?.listDetalle;
+      if (conTabla(l)) {
+        listDetalle = l;
+        break;
+      }
+    }
+    if (!conTabla(listDetalle)) {
+      return { secciones: [], error: "El resumen informa casos pero el SII no devolvió el detalle en ninguna sección." };
+    }
+  }
   const secciones: object[] = [];
-  for (const [seccion, tablas] of Object.entries(primera?.listDetalle ?? {})) {
+  for (const [seccion, tablas] of Object.entries(listDetalle ?? {})) {
     for (const [nombre, t] of Object.entries(tablas ?? {})) {
       const total = t?.cantRegistros ?? 0;
       const paginas: unknown[] = t?.tabla ? [t.tabla] : [];
@@ -1778,7 +1792,7 @@ async function descargarSeccionesDj(page: Page, base: Record<string, unknown>): 
       });
     }
   }
-  return secciones;
+  return { secciones };
 }
 
 async function descargarDDJJDetalle(page: Page, rut: string, at: string, dj: string): Promise<object> {
@@ -1811,7 +1825,7 @@ async function descargarDDJJDetalle(page: Page, rut: string, at: string, dj: str
         datos: t?.tabla ?? null,
       }))
     );
-    const detalle = await descargarSeccionesDj(page, base);
+    const { secciones: detalle, error: errorDetalle } = await descargarSeccionesDj(page, base, 1, (p.casos ?? 0) > 0);
     // Sin observaciones el SII devuelve [{ observacion: "", descripcion: "Sin Información" }].
     const obs = await callTercerosService<DjObservacionRaw[] | null>(page, "getDjObservacion", base);
     const observaciones = (Array.isArray(obs) ? obs : [])
@@ -1833,6 +1847,7 @@ async function descargarDDJJDetalle(page: Page, rut: string, at: string, dj: str
       casos: p.casos ?? null,
       resumen,
       detalle,
+      ...(errorDetalle ? { error: errorDetalle } : {}),
       observaciones,
       historial: Array.isArray(historial) ? historial : [],
     });

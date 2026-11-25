@@ -256,7 +256,7 @@
           }
         },
         "url": "{{base_url}}/api/terceros/2026",
-        "description": "Lo que terceros (empleadores, bancos, AFP, sociedades) informaron del contribuyente en sus DDJJ. Devuelve por cada DJ el resumen y el detalle como tablas crudas de presentación. Pensado para personas naturales; una empresa suele responder vacío."
+        "description": "Lo que terceros (empleadores, bancos, AFP, sociedades) informaron del contribuyente en sus DDJJ. Devuelve por cada DJ el resumen y el detalle por sección (detalle: [{ seccion, tabla, cantRegistros, paginas: [tabla…] }]) como tablas crudas del SII. Pensado para personas naturales; una empresa suele responder vacío."
       }
     },
     {
