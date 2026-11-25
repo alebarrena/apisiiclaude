@@ -1610,8 +1610,21 @@ async function descargarDDJJEstado(page: Page, rut: string, at: string): Promise
 // Lo que terceros (empleadores, bancos, AFP, sociedades) informaron del contribuyente en sus DDJJ:
 // la pantalla "Información para declarar" del SII. Las tablas se devuelven CRUDAS (tabla de
 // presentación con celdas colspan/rowspan): la interpretación de columnas queda en el consumidor.
-// Implementado según la especificación del documento de requerimientos; con la cuenta de prueba
-// (empresa) el servicio responde vacío, así que la forma con datos no está validada aquí.
+// Validado con una persona real (AT 2026): la tabla viene como rejilla completa.
+
+const ENTIDADES_HTML: Record<string, string> = {
+  aacute: "á", eacute: "é", iacute: "í", oacute: "ó", uacute: "ú", ntilde: "ñ",
+  Aacute: "Á", Eacute: "É", Iacute: "Í", Oacute: "Ó", Uacute: "Ú", Ntilde: "Ñ",
+  uuml: "ü", deg: "°", ordm: "º", amp: "&", quot: "\"", nbsp: " ",
+};
+
+// Textos del SII: algunos llegan con UTF-8 leído como Latin-1 ("EnajenaciÃ³n") y otros con
+// entidades HTML ("Electr&oacute;nico").
+function textoSii(s: string | null | undefined): string | null {
+  if (s == null) return null;
+  const t = s.includes("Ã") ? Buffer.from(s, "latin1").toString("utf8") : s;
+  return t.replace(/&([a-zA-Z]+);/g, (m, e: string) => ENTIDADES_HTML[e] ?? m);
+}
 
 const TERCEROS_NS = "cl.sii.sdi.lob.renta.djconsultarenta.data.api.interfaces.FacadeService";
 const TERCEROS_MAX_PAGINAS = 20;
@@ -1676,13 +1689,9 @@ async function descargarTerceros(page: Page, rut: string, at: string): Promise<o
       } catch (err) {
         error = err instanceof Error ? err.message : "Error desconocido";
       }
-      // Algunos títulos llegan con UTF-8 leído como Latin-1 ("EnajenaciÃ³n"): se recodifican.
-      const titulo = entrada.title?.includes("Ã")
-        ? Buffer.from(entrada.title, "latin1").toString("utf8")
-        : entrada.title ?? null;
       djs.push({
         dj: Number(dj),
-        titulo,
+        titulo: textoSii(entrada.title),
         resumen: resumen?.tabla ?? null,
         detalle,
         ...(error ? { error } : {}),
@@ -1698,6 +1707,222 @@ async function descargarTerceros(page: Page, rut: string, at: string): Promise<o
     },
   };
 }
+
+// ─── Contenido de las DDJJ propias (djconsultarentaui, tipoConsulta 1) ───────
+// Lo que el propio contribuyente presentó en una DJ (p. ej. la 1947 con sus socios). Es la
+// pantalla "Consulta de estado DDJJ" → "Ver detalle". Mismas tablas crudas que en terceros.
+
+const DDJJ_DETALLE_MAX_PAGINAS = 50;
+const DDJJ_DETALLE_MAX_PRESENTACIONES = 5;
+
+interface DjPresentacionRaw {
+  key?: number;
+  codEstado?: number;
+  estado?: string;
+  fecha?: string;
+  mes?: string | null;
+  folio?: number;
+  medioPresentacion?: string;
+  tipoDeclaracion?: string;
+  casos?: number;
+}
+
+interface DjIntegralRaw {
+  dj?: number;
+  titulo?: string;
+  result?: DjPresentacionRaw[];
+}
+
+// { "SECCIÓN B": { detalle: { tabla, cantRegistros, ... } } }
+type TablasPorSeccionRaw = Record<string, Record<string, TerceroTablaRaw | null> | null>;
+
+interface DjObservacionRaw {
+  observacion?: string;
+  descripcion?: string;
+  glosaObservacion?: string | null;
+}
+
+async function descargarSeccionesDj(page: Page, base: Record<string, unknown>): Promise<object[]> {
+  const pedir = (p: number, seccion: string) =>
+    callTercerosService<{ listDetalle?: TablasPorSeccionRaw } | null>(page, "getDjDetalle", {
+      ...base, page: p, seccion, tipoConsulta: 1,
+    });
+  const primera = await pedir(1, "");
+  const secciones: object[] = [];
+  for (const [seccion, tablas] of Object.entries(primera?.listDetalle ?? {})) {
+    for (const [nombre, t] of Object.entries(tablas ?? {})) {
+      const total = t?.cantRegistros ?? 0;
+      const paginas: unknown[] = t?.tabla ? [t.tabla] : [];
+      const vistas = new Set([JSON.stringify(t?.tabla ?? null)]);
+      let error: string | undefined;
+      try {
+        // El SII no dice cuántos registros van por página: se pide la siguiente hasta que
+        // venga vacía o repetida.
+        for (let p = 2; total > 1 && paginas.length > 0 && p <= DDJJ_DETALLE_MAX_PAGINAS; p++) {
+          const d = await pedir(p, seccion);
+          const tabla = d?.listDetalle?.[seccion]?.[nombre]?.tabla;
+          const clave = JSON.stringify(tabla ?? null);
+          if (!tabla || Object.keys(tabla as object).length === 0 || vistas.has(clave)) break;
+          vistas.add(clave);
+          paginas.push(tabla);
+        }
+      } catch (err) {
+        error = err instanceof Error ? err.message : "Error desconocido";
+      }
+      secciones.push({
+        seccion: textoSii(seccion),
+        tabla: nombre,
+        cantRegistros: total,
+        paginas,
+        ...(error ? { error } : {}),
+      });
+    }
+  }
+  return secciones;
+}
+
+async function descargarDDJJDetalle(page: Page, rut: string, at: string, dj: string): Promise<object> {
+  await page.goto("https://www4.sii.cl/djconsultarentaui/internet/#/consulta/", {
+    waitUntil: "load",
+    timeout: PAGE_TIMEOUT_MS,
+  });
+  await page.waitForNetworkIdle({ idleTime: 2_000, timeout: 20_000 }).catch(() => {});
+  const [num, dv] = rut.split("-");
+
+  const lista = await callTercerosService<DjIntegralRaw[] | null>(page, "getDjIntegralAnualDetalle", {
+    periodo: Number(at), rut: num, dv,
+  });
+  const entrada = (Array.isArray(lista) ? lista : []).find((x) => Number(x.dj) === Number(dj));
+  if (!entrada?.result?.length) {
+    throw new SinDeclaracionError(`No hay DJ ${dj} presentada para el año tributario ${at}.`);
+  }
+
+  const presentaciones: object[] = [];
+  for (const p of entrada.result.slice(0, DDJJ_DETALLE_MAX_PRESENTACIONES)) {
+    const base = { periodo: `${at}${p.mes ?? "00"}`, rut: num, dv, dj: Number(dj), key: p.key };
+    const resumenRaw = await callTercerosService<{ listResumen?: TablasPorSeccionRaw } | null>(
+      page, "getDjResumen", { ...base, page: 1, seccion: "", tipoConsulta: 1 }
+    );
+    const resumen = Object.entries(resumenRaw?.listResumen ?? {}).flatMap(([seccion, tablas]) =>
+      Object.entries(tablas ?? {}).map(([nombre, t]) => ({
+        seccion: textoSii(seccion),
+        tabla: nombre,
+        cantRegistros: t?.cantRegistros ?? 0,
+        datos: t?.tabla ?? null,
+      }))
+    );
+    const detalle = await descargarSeccionesDj(page, base);
+    // Sin observaciones el SII devuelve [{ observacion: "", descripcion: "Sin Información" }].
+    const obs = await callTercerosService<DjObservacionRaw[] | null>(page, "getDjObservacion", base);
+    const observaciones = (Array.isArray(obs) ? obs : [])
+      .filter((o) => o.observacion)
+      .map((o) => ({
+        codigo: o.observacion,
+        descripcion: textoSii(o.descripcion),
+        glosa: textoSii(o.glosaObservacion),
+      }));
+    const historial = await callTercerosService<unknown[] | null>(page, "getDjHistorial", base);
+    presentaciones.push({
+      key: p.key ?? null,
+      folio: p.folio ?? null,
+      fecha: p.fecha ?? null,
+      estado: textoSii(p.estado),
+      codEstado: p.codEstado ?? null,
+      tipoDeclaracion: textoSii(p.tipoDeclaracion),
+      medioPresentacion: textoSii(p.medioPresentacion),
+      casos: p.casos ?? null,
+      resumen,
+      detalle,
+      observaciones,
+      historial: Array.isArray(historial) ? historial : [],
+    });
+  }
+
+  return {
+    at: Number(at),
+    dj: Number(dj),
+    titulo: textoSii(entrada.titulo),
+    presentaciones,
+    ...(entrada.result.length > DDJJ_DETALLE_MAX_PRESENTACIONES
+      ? { aviso: `Se devuelven las primeras ${DDJJ_DETALLE_MAX_PRESENTACIONES} de ${entrada.result.length} presentaciones.` }
+      : {}),
+    origen: {
+      servicio: "https://www4.sii.cl/djconsultarentaui/internet/#/consulta/ (getDjIntegralAnualDetalle, getDjResumen, getDjDetalle, getDjObservacion, getDjHistorial)",
+      descargado: new Date().toISOString(),
+    },
+  };
+}
+
+// ─── Catálogo de códigos del F22 por AT ──────────────────────────────────────
+// Es un JSON estático y público que usa el formulario F22 en línea (www2.sii.cl/f22): no
+// requiere sesión ni pasa por navegacionf22. Cuando el SII aún no publica un AT, la ruta
+// devuelve la página HTML de la app en vez del JSON.
+
+const CATALOGO_F22_TTL_MS = 24 * 60 * 60_000;
+const catalogoF22Cache = new Map<string, { datos: object; en: number }>();
+
+interface CodigoF22Raw {
+  codigo?: number;
+  descripcion_web?: string;
+  descripcion_corta?: string;
+  tipo_dato?: string;
+  tipo_codigo?: string;
+}
+
+async function obtenerCatalogoF22(at: string): Promise<object> {
+  const enCache = catalogoF22Cache.get(at);
+  if (enCache && Date.now() - enCache.en < CATALOGO_F22_TTL_MS) return enCache.datos;
+
+  const url = `https://www2.sii.cl/f22/json/${at}/codigosF22.json`;
+  const r = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+  if (!r.ok) throw new Error(`El SII respondió ${r.status} al pedir el catálogo de códigos del F22`);
+  if (!(r.headers.get("content-type") ?? "").includes("json")) {
+    throw new SinDeclaracionError(`El SII no tiene publicado el catálogo de códigos del F22 para el año tributario ${at}.`);
+  }
+  const raw = (await r.json()) as unknown;
+  if (!Array.isArray(raw)) throw new Error("Respuesta no válida del SII al pedir el catálogo de códigos del F22");
+
+  const codigos = (raw as CodigoF22Raw[]).map((c) => ({
+    codigo: c.codigo ?? null,
+    descripcion: c.descripcion_web ?? null,
+    descripcionCorta: c.descripcion_corta ?? null,
+    tipoDato: c.tipo_dato ?? null,
+    tipoCodigo: c.tipo_codigo ?? null,
+  }));
+  const datos = {
+    at: Number(at),
+    total: codigos.length,
+    codigos,
+    origen: { url, descargado: new Date().toISOString() },
+  };
+  if (catalogoF22Cache.size >= 20) catalogoF22Cache.clear();
+  catalogoF22Cache.set(at, { datos, en: Date.now() });
+  return datos;
+}
+
+const catalogoLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Demasiadas consultas del catálogo. Espere un momento antes de intentarlo de nuevo." },
+});
+
+// No usa credenciales del SII: si el body las trae, se ignoran.
+app.post("/api/F22/catalogo/:at", requireApiKey, catalogoLimiter, async (req: Request, res: Response) => {
+  const { at } = req.params;
+  if (!YEAR_REGEX.test(at)) {
+    res.status(400).json({ error: "Año inválido. Use un año de 4 dígitos." });
+    return;
+  }
+  try {
+    res.json(await obtenerCatalogoF22(at));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Error desconocido";
+    console.error("[/api/F22/catalogo] Error:", message);
+    res.status(estadoHttpDeError(err)).json({ error: message });
+  }
+});
 
 function rutaPorAnioTributario(
   ruta: string,
@@ -1734,6 +1959,35 @@ rutaPorAnioTributario("/api/F22/estado/:at", "estado F22", descargarF22Estado);
 rutaPorAnioTributario("/api/DDJJ/estado/:at", "estado DDJJ", descargarDDJJEstado);
 rutaPorAnioTributario("/api/terceros/:at", "información de terceros", descargarTerceros);
 rutaPorAnioTributario("/api/boletas/recibidas-anual/:at", "informe anual BHE", (page, _rut, anio) => descargarBHEAnual(page, anio));
+
+const DJ_REGEX = /^\d{4}$/;
+
+app.post("/api/DDJJ/detalle/:at/:dj", requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
+  const { at, dj } = req.params;
+  if (!YEAR_REGEX.test(at)) {
+    res.status(400).json({ error: "Año inválido. Use un año de 4 dígitos." });
+    return;
+  }
+  if (!DJ_REGEX.test(dj)) {
+    res.status(400).json({ error: "Número de DJ inválido. Use el número de 4 dígitos (p. ej. 1947)." });
+    return;
+  }
+  const creds = getRcvCredentialsFromBody(req.body, res);
+  if (!creds) return;
+  if (!checkRutCooldown(creds.user, res)) return;
+  try {
+    const data = await withTimeout(
+      conSesionSii("detalle DDJJ", creds.user, creds.pass, (page) => descargarDDJJDetalle(page, creds.user, at, dj)),
+      REQUEST_TIMEOUT_MS,
+      "consulta detalle DDJJ"
+    );
+    res.json(data);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Error desconocido";
+    console.error("[/api/DDJJ/detalle] Error:", message);
+    res.status(estadoHttpDeError(err)).json({ error: message });
+  }
+});
 
 app.post("/api/F29/declaracion/:month/:year", requireApiKey, heavyLimiter, async (req: Request, res: Response) => {
   const { month, year } = req.params;
@@ -1847,13 +2101,15 @@ app.post("/api/boletas/recibidas/:month/:year", requireApiKey, heavyLimiter, asy
 
 type TipoLote =
   | "f29_detalle" | "rcv_compras" | "rcv_ventas" | "bhe_recibidas"
-  | "f22_detalle" | "f22_estado" | "ddjj_estado" | "bhe_anual" | "terceros";
+  | "f22_detalle" | "f22_estado" | "ddjj_estado" | "ddjj_detalle" | "bhe_anual" | "terceros";
 const TIPOS_LOTE: readonly TipoLote[] = [
   "f29_detalle", "rcv_compras", "rcv_ventas", "bhe_recibidas",
-  "f22_detalle", "f22_estado", "ddjj_estado", "bhe_anual", "terceros",
+  "f22_detalle", "f22_estado", "ddjj_estado", "ddjj_detalle", "bhe_anual", "terceros",
 ];
 // Tipos anuales: `anio` es el año tributario y no llevan mes.
-const TIPOS_LOTE_ANUALES: readonly TipoLote[] = ["f22_detalle", "f22_estado", "ddjj_estado", "bhe_anual", "terceros"];
+const TIPOS_LOTE_ANUALES: readonly TipoLote[] = [
+  "f22_detalle", "f22_estado", "ddjj_estado", "ddjj_detalle", "bhe_anual", "terceros",
+];
 const LOTE_MAX_ITEMS = 50;
 const LOTE_ITEM_TIMEOUT_MS = 180_000;
 const LOTE_PAUSA_ENTRE_ITEMS_MS = 2_000;
@@ -1865,6 +2121,7 @@ interface ItemLote {
   mes?: number;
   anio: number;
   detallado?: boolean;
+  dj?: number;
 }
 
 interface ResultadoLote {
@@ -1922,6 +2179,13 @@ function validarItemsLote(raw: unknown): { items: ItemLote[] } | { error: string
     }
     const item: ItemLote = anual ? { tipo: it.tipo as TipoLote, anio } : { tipo: it.tipo as TipoLote, mes, anio };
     if (it.tipo === "rcv_compras" || it.tipo === "rcv_ventas") item.detallado = it.detallado === true;
+    if (it.tipo === "ddjj_detalle") {
+      const dj = Number(it.dj);
+      if (!Number.isInteger(dj) || !DJ_REGEX.test(String(dj))) {
+        return { error: `Ítem ${i}: 'dj' inválido. Use el número de 4 dígitos (p. ej. 1947).` };
+      }
+      item.dj = dj;
+    }
     items.push(item);
   }
   return { items };
@@ -1945,6 +2209,8 @@ function descargarItemLote(page: Page, rut: string, item: ItemLote): Promise<obj
       return descargarF22Estado(page, rut, anio);
     case "ddjj_estado":
       return descargarDDJJEstado(page, rut, anio);
+    case "ddjj_detalle":
+      return descargarDDJJDetalle(page, rut, anio, String(item.dj));
     case "bhe_anual":
       return descargarBHEAnual(page, anio);
     case "terceros":
